@@ -7,6 +7,7 @@ import argparse
 from pathlib import Path
 from typing import List, Dict, Tuple
 from datetime import datetime  # [TIME-LAYER]
+from torch.utils.checkpoint import checkpoint
 
 import torch
 import torch.nn as nn
@@ -21,7 +22,7 @@ from tqdm import tqdm  # [NEW]
 # -------------------------------
 # Константы по умолчанию (можно переопределить через CLI)
 # -------------------------------
-EPOCHS = 10
+EPOCHS = 1
 STEPS_PER_EPOCH = 782
 BATCH_SIZE = 64
 NUM_WORKERS = 4
@@ -111,6 +112,76 @@ def build_model(num_classes: int, ckpt: bool = False):
         print(f'Чекпоинт включен')
     return model
 
+def inject_dynamic_checkpointing(model: nn.Module,
+                                 device: torch.device,
+                                 mem_cap_bytes: int,
+                                 step_ref,
+                                 memlog,
+                                 epoch_ref,
+                                 threshold_ratio: float = 0.9,):
+    """
+    Адаптивное градиентное чекпоинтирование поверх ViT-блоков.
+
+    Идея (для КАЖДОГО train-step):
+      * Пока выделенная память < threshold_ratio * mem_cap_bytes -> блок считает обычный forward.
+      * Как только в каком-то блоке память достигает порога, этот блок в ЭТОМ step
+        начинает выполняться через torch.utils.checkpoint.checkpoint (и так же все последующие,
+        у которых тоже хватит памяти, т.к. она уже большая).
+      * Во время recompute на backward мы НЕ вкладываем checkpoint внутрь checkpoint
+        (флаг b._in_recompute).
+    """
+    for idx, block in enumerate(model.blocks, start=1):
+        orig_forward = block.forward  # "чистый" forward без чекпоинта
+
+        # служебные флаги на модуле
+        block._ckpt_last_step = -1
+        block._use_ckpt_after = False
+        block._in_recompute = False
+
+        def make_forward(b, orig_fwd):
+            def forward(x):
+                # В режиме eval / no_grad чекпоинт не нужен
+                if not torch.is_grad_enabled():
+                    return orig_fwd(x)
+
+                # Определяем, начался ли новый training step
+                cur_step = step_ref()
+                if getattr(b, "_ckpt_last_step", -1) != cur_step:
+                    b._ckpt_last_step = cur_step
+                    b._use_ckpt_after = False  # каждый step начинаем "с нуля"
+
+                # Если мы находимся внутри recompute (backward),
+                # просто выполняем обычный forward без нового checkpoint()
+                if getattr(b, "_in_recompute", False):
+                    return orig_fwd(x)
+
+                # Если чекпоинт ещё не включён для этого блока в данном step —
+                # проверяем текущую выделенную память
+                if not b._use_ckpt_after:
+                    cur_bytes = torch.cuda.memory_allocated(device=device)
+                    if cur_bytes >= threshold_ratio * mem_cap_bytes:
+                        b._use_ckpt_after = True  # начиная с этого блока в этом step используем ckpt
+
+                if not b._use_ckpt_after:
+                    # Памяти ещё достаточно — обычный forward
+                    return orig_fwd(x)
+
+                # Чекпоинтирование этого блока.
+                # Внутрь checkpoint передаём функцию, которая ставит флаг "_in_recompute"
+                # на время recompute, чтобы не делать вложенный checkpoint.
+                def run_block(inp):
+                    memlog.log_now(epoch_ref(), step_ref(), "fwd_re", idx)
+                    was_flag = b._in_recompute
+                    b._in_recompute = True
+                    try:
+                        return orig_fwd(inp)
+                    finally:
+                        b._in_recompute = was_flag
+
+                return checkpoint(run_block, x)
+            return forward
+
+        block.forward = make_forward(block, orig_forward)
 
 # -------------------------------
 # Power/Energy logger via NVML
@@ -328,6 +399,13 @@ def parse_args():
     # [NEW] SAM: список альф (равны бета), по умолчанию 1..5
     ap.add_argument("--sam-ab", type=str, default="1,2,3,4,5",
                     help="Список значений для α=β, через запятую. Пример: 1,3,5")
+    ap.add_argument(
+        "--ckpt-mode",
+        type=str,
+        default=("adaptive" if CHECKPOINT else "none"),
+        choices=["none", "static", "adaptive"],
+        help="Режим градиентного чекпоинта: none / static / adaptive"
+    )
     return ap.parse_args()
 
 
@@ -375,22 +453,21 @@ def train():
     args = parse_args()
     set_seed(SEED)
     device = ensure_cuda()
-    # ---- GPU memory cap (ДО любых CUDA-аллокаций!) ----
-    try:
-        total_bytes = torch.cuda.get_device_properties(GPU_INDEX).total_memory  # int (байты)
-        cap_gb = max(0.1, MEMORY_CAPACITY_GB)
-        cap_bytes = cap_gb * (1024 ** 3)
-        frac = min(0.99, cap_bytes / total_bytes)
+    ckpt_mode = args.ckpt_mode
 
+    # ---- GPU memory cap (и порог для адаптивного чекпоинта) ----
+    total_bytes = torch.cuda.get_device_properties(GPU_INDEX).total_memory  # байты
+    cap_gb = max(0.1, MEMORY_CAPACITY_GB)
+    cap_bytes = int(cap_gb * (1024 ** 3))
+
+    try:
+        frac = min(0.99, cap_bytes / total_bytes)
         # ВАЖНО: перед первыми .to(device)/CUDA-тензорами
-        torch.cuda.set_per_process_memory_fraction(frac, device=GPU_INDEX)  # <-- индекс!
+        torch.cuda.set_per_process_memory_fraction(frac, device=GPU_INDEX)
         print(f"[GPU MEM CAP] Limiting allocator to ~{cap_gb:.2f} GB "
               f"({frac * 100:.1f}% of {total_bytes / (1024 ** 3):.1f} GB) on cuda:{GPU_INDEX}.")
     except AttributeError:
         # Fallback: «резервируем» лишнюю память большим тензором
-        total_bytes = torch.cuda.get_device_properties(GPU_INDEX).total_memory
-        cap_gb = max(0.1, MEMORY_CAPACITY_GB)
-        cap_bytes = int(cap_gb * (1024 ** 3))
         reserve = max(0, int(total_bytes - cap_bytes - 256 * 1024 ** 2))
         if reserve > 0:
             global _GPU_MEM_RESERVER
@@ -400,27 +477,43 @@ def train():
         else:
             print("[GPU MEM CAP/Fallback] Skipped: requested cap >= total VRAM.")
 
-    ckpt = CHECKPOINT
-
     # SAM α=β список
     ab_vals = [int(s.strip()) for s in args.sam_ab.split(",") if s.strip()]
     ab_vals = [v for v in ab_vals if v >= 1]
-    ab_vals = sorted(set(ab_vals)) if ab_vals else [1,2,3,4,5]
+    ab_vals = sorted(set(ab_vals)) if ab_vals else [1, 2, 3, 4, 5]
     ensure_metrics_csv_header(ab_vals)
 
     train_loader, test_loader = make_dataloaders(args.steps_per_epoch, args.batch_size, args.num_workers)
-    model = build_model(NUM_CLASSES, ckpt=ckpt).to(device)
+
+    # static checkpoint только если явно выбран режим static
+    use_static_ckpt = (ckpt_mode == "static")
+    model = build_model(NUM_CLASSES, ckpt=use_static_ckpt).to(device)
 
     optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
     criterion = nn.CrossEntropyLoss()
-    scaler = torch.cuda.amp.GradScaler(enabled=args.amp)  # [NEW]
+    scaler = torch.cuda.amp.GradScaler(enabled=args.amp)
 
     cur_epoch = {"v": 0}
-    cur_step  = {"v": 0}
+    cur_step = {"v": 0}
     epoch_ref = lambda: cur_epoch["v"]
-    step_ref  = lambda: cur_step["v"]
+    step_ref = lambda: cur_step["v"]
 
     memlog = MemLogger(device, n_layers=len(model.blocks))
+
+    # [NEW] Адаптивное чекпоинтирование по VRAM
+    if ckpt_mode == "adaptive":
+        # Например, используем порог 70% от MEMORY_CAPACITY_GB
+        inject_dynamic_checkpointing(
+            model,
+            device=device,
+            mem_cap_bytes=cap_bytes,
+            step_ref=step_ref,
+            threshold_ratio=0.55,
+            memlog=memlog,
+            epoch_ref=epoch_ref
+        )
+        print(f"[Adaptive CKPT] Enabled with threshold {0.55 * cap_gb:.2f} GB (~55% of cap).")
+
     handles = attach_mem_hooks(model, memlog, epoch_ref, step_ref)
 
     # [NEW] Power meter
