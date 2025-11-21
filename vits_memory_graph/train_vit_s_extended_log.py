@@ -22,7 +22,7 @@ from tqdm import tqdm  # [NEW]
 # -------------------------------
 # Константы по умолчанию (можно переопределить через CLI)
 # -------------------------------
-EPOCHS = 1
+EPOCHS = 10
 STEPS_PER_EPOCH = 782
 BATCH_SIZE = 64
 NUM_WORKERS = 4
@@ -112,76 +112,8 @@ def build_model(num_classes: int, ckpt: bool = False):
         print(f'Чекпоинт включен')
     return model
 
-def inject_dynamic_checkpointing(model: nn.Module,
-                                 device: torch.device,
-                                 mem_cap_bytes: int,
-                                 step_ref,
-                                 memlog,
-                                 epoch_ref,
-                                 threshold_ratio: float = 0.9,):
-    """
-    Адаптивное градиентное чекпоинтирование поверх ViT-блоков.
 
-    Идея (для КАЖДОГО train-step):
-      * Пока выделенная память < threshold_ratio * mem_cap_bytes -> блок считает обычный forward.
-      * Как только в каком-то блоке память достигает порога, этот блок в ЭТОМ step
-        начинает выполняться через torch.utils.checkpoint.checkpoint (и так же все последующие,
-        у которых тоже хватит памяти, т.к. она уже большая).
-      * Во время recompute на backward мы НЕ вкладываем checkpoint внутрь checkpoint
-        (флаг b._in_recompute).
-    """
-    for idx, block in enumerate(model.blocks, start=1):
-        orig_forward = block.forward  # "чистый" forward без чекпоинта
 
-        # служебные флаги на модуле
-        block._ckpt_last_step = -1
-        block._use_ckpt_after = False
-        block._in_recompute = False
-
-        def make_forward(b, orig_fwd):
-            def forward(x):
-                # В режиме eval / no_grad чекпоинт не нужен
-                if not torch.is_grad_enabled():
-                    return orig_fwd(x)
-
-                # Определяем, начался ли новый training step
-                cur_step = step_ref()
-                if getattr(b, "_ckpt_last_step", -1) != cur_step:
-                    b._ckpt_last_step = cur_step
-                    b._use_ckpt_after = False  # каждый step начинаем "с нуля"
-
-                # Если мы находимся внутри recompute (backward),
-                # просто выполняем обычный forward без нового checkpoint()
-                if getattr(b, "_in_recompute", False):
-                    return orig_fwd(x)
-
-                # Если чекпоинт ещё не включён для этого блока в данном step —
-                # проверяем текущую выделенную память
-                if not b._use_ckpt_after:
-                    cur_bytes = torch.cuda.memory_allocated(device=device)
-                    if cur_bytes >= threshold_ratio * mem_cap_bytes:
-                        b._use_ckpt_after = True  # начиная с этого блока в этом step используем ckpt
-
-                if not b._use_ckpt_after:
-                    # Памяти ещё достаточно — обычный forward
-                    return orig_fwd(x)
-
-                # Чекпоинтирование этого блока.
-                # Внутрь checkpoint передаём функцию, которая ставит флаг "_in_recompute"
-                # на время recompute, чтобы не делать вложенный checkpoint.
-                def run_block(inp):
-                    memlog.log_now(epoch_ref(), step_ref(), "fwd_re", idx)
-                    was_flag = b._in_recompute
-                    b._in_recompute = True
-                    try:
-                        return orig_fwd(inp)
-                    finally:
-                        b._in_recompute = was_flag
-
-                return checkpoint(run_block, x)
-            return forward
-
-        block.forward = make_forward(block, orig_forward)
 
 # -------------------------------
 # Power/Energy logger via NVML
@@ -500,24 +432,26 @@ def train():
 
     memlog = MemLogger(device, n_layers=len(model.blocks))
 
+    # [NEW] Power meter
+    pwr = GpuPowerMeter(device_index=GPU_INDEX)
+
     # [NEW] Адаптивное чекпоинтирование по VRAM
     if ckpt_mode == "adaptive":
-        # Например, используем порог 70% от MEMORY_CAPACITY_GB
         inject_dynamic_checkpointing(
             model,
             device=device,
             mem_cap_bytes=cap_bytes,
             step_ref=step_ref,
-            threshold_ratio=0.55,
             memlog=memlog,
-            epoch_ref=epoch_ref
+            epoch_ref=epoch_ref,
+            pwr=pwr,  # <--- ДОБАВЛЕНО
+            threshold_ratio=0.55
         )
         print(f"[Adaptive CKPT] Enabled with threshold {0.55 * cap_gb:.2f} GB (~55% of cap).")
 
     handles = attach_mem_hooks(model, memlog, epoch_ref, step_ref)
 
-    # [NEW] Power meter
-    pwr = GpuPowerMeter(device_index=GPU_INDEX)
+
 
     try:
         global_step = 0
@@ -746,6 +680,99 @@ def attach_mem_hooks(model: nn.Module, memlog: MemLogger, epoch_ref, step_ref):
 
     return handles
 
+
+def inject_dynamic_checkpointing(model: nn.Module,
+                                 device: torch.device,
+                                 mem_cap_bytes: int,
+                                 step_ref,
+                                 memlog: MemLogger,
+                                 epoch_ref,
+                                 pwr=None,
+                                 threshold_ratio: float = 0.9):
+    """
+    Адаптивное градиентное чекпоинтирование поверх ViT-блоков.
+
+    Дополнительно:
+      - логируем fwd_re (recompute-forward) в memlog (memory + layer_time),
+      - логируем энергию через pwr.log_step(..., phase="train_fwd_re", ...).
+    """
+    for layer_idx, block in enumerate(model.blocks, start=1):
+        orig_forward = block.forward  # "чистый" forward без чекпоинта
+
+        # служебные флаги на модуле
+        block._ckpt_last_step = -1
+        block._use_ckpt_after = False
+        block._in_recompute = False
+
+        def make_forward(b, orig_fwd, layer_idx):
+            def forward(x):
+                # В режиме eval / no_grad чекпоинт не нужен
+                if not torch.is_grad_enabled():
+                    return orig_fwd(x)
+
+                # Определяем, начался ли новый training step
+                cur_step = step_ref()
+                if getattr(b, "_ckpt_last_step", -1) != cur_step:
+                    b._ckpt_last_step = cur_step
+                    b._use_ckpt_after = False  # каждый step начинаем "с нуля"
+
+                # Если мы находимся внутри recompute (backward),
+                # просто выполняем обычный forward без нового checkpoint()
+                if getattr(b, "_in_recompute", False):
+                    return orig_fwd(x)
+
+                # Если чекпоинт ещё не включён для этого блока в данном step —
+                # проверяем текущую выделенную память
+                if not b._use_ckpt_after:
+                    cur_bytes = torch.cuda.memory_allocated(device=device)
+                    if cur_bytes >= threshold_ratio * mem_cap_bytes:
+                        b._use_ckpt_after = True  # начиная с этого блока в этом step используем ckpt
+
+                if not b._use_ckpt_after:
+                    # Памяти ещё достаточно — обычный forward
+                    return orig_fwd(x)
+
+                # Чекпоинтирование этого блока.
+                # Внутрь checkpoint передаём функцию, которая ставит флаг "_in_recompute"
+                # на время recompute, чтобы не делать вложенный checkpoint.
+                def run_block(inp):
+                    # ----- LOG: память в момент recompute-forward -----
+                    memlog.log_now(epoch_ref(), step_ref(), "fwd_re", layer_idx)
+
+                    # ----- LOG: время слоя (GPU) для recompute-forward -----
+                    start_ev = torch.cuda.Event(enable_timing=True)
+                    end_ev = torch.cuda.Event(enable_timing=True)
+                    start_ev.record(torch.cuda.current_stream())
+
+                    # ----- LOG: энергия для recompute-forward -----
+                    t0 = time.time()
+                    p_start = pwr.sample_power_w() if pwr is not None else float("nan")
+
+                    was_flag = b._in_recompute
+                    b._in_recompute = True
+                    try:
+                        out = orig_fwd(inp)
+                    finally:
+                        b._in_recompute = was_flag
+
+                    end_ev.record(torch.cuda.current_stream())
+                    end_ev.synchronize()
+                    ms = start_ev.elapsed_time(end_ev)
+                    memlog.log_layer_time(epoch_ref(), step_ref(), "fwd_re", layer_idx, ms)
+
+                    if pwr is not None:
+                        step_t = time.time() - t0
+                        p_end = pwr.sample_power_w()
+                        # отдельная строка в step_energy.csv с phase="train_fwd_re"
+                        pwr.log_step("train_fwd_re", epoch_ref(), step_ref(), step_t, p_start, p_end)
+
+                    return out
+
+                return checkpoint(run_block, x, use_reentrant=False)
+            return forward
+
+        # ВАЖНО: передаём layer_idx в замыкание, иначе всегда будет последний (12)
+        block.forward = make_forward(block, orig_forward, layer_idx)
 
 if __name__ == "__main__":
     """
