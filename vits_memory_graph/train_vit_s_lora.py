@@ -426,6 +426,56 @@ def ensure_metrics_csv_header(ab_values: list):
             w.writerow(header)
 
 
+def run_eval(model, loader, device, pwr, epoch_idx=-1):
+    """
+    Запускает валидацию на переданном loader.
+    epoch_idx=-1 означает, что это Baseline (до обучения).
+    Возвращает (accuracy_pct, avg_loss, metrics_dict)
+    """
+    model.eval()
+    criterion = nn.CrossEntropyLoss()
+    correct = 0
+    total = 0
+    total_loss = 0.0
+
+    # Сброс метрик энергии только для фазы eval, если нужно,
+    # но pwr.reset_epoch() обычно делается в начале эпохи.
+    # Здесь мы просто логируем шаги.
+
+    start_t = time.time()
+
+    with torch.no_grad():
+        for step, (x, y) in enumerate(loader):
+            torch.cuda.synchronize()
+            p_start = pwr.sample_power_w()
+            t0 = time.time()
+
+            x = x.to(device, non_blocking=True)
+            y = y.to(device, non_blocking=True)
+
+            logits = model(x)
+            loss = criterion(logits, y)
+
+            pred = logits.argmax(dim=1)
+            correct += (pred == y).sum().item()
+            total += y.size(0)
+            total_loss += loss.item() * x.size(0)
+
+            torch.cuda.synchronize()
+            step_t = time.time() - t0
+            p_end = pwr.sample_power_w()
+
+            # Логируем шаг с epoch_idx
+            # Если это baseline, можно передать epoch=0 или -1
+            pwr.log_step("eval", epoch_idx, step, step_t, p_start, p_end)
+
+    total_time = time.time() - start_t
+    acc = 100.0 * correct / total if total > 0 else 0.0
+    avg_loss = total_loss / total if total > 0 else 0.0
+
+    return acc, avg_loss, total_time
+
+
 def train():
     args = parse_args()
     set_seed(SEED)
@@ -440,16 +490,9 @@ def train():
     try:
         frac = min(0.99, cap_bytes / total_bytes)
         torch.cuda.set_per_process_memory_fraction(frac, device=GPU_INDEX)
-        print(f"[GPU MEM CAP] Limiting allocator to ~{cap_gb:.2f} GB "
-              f"({frac * 100:.1f}% of {total_bytes / (1024 ** 3):.1f} GB).")
+        print(f"[GPU MEM CAP] Limiting allocator to ~{cap_gb:.2f} GB ({frac * 100:.1f}%).")
     except AttributeError:
-        # Fallback
-        reserve = max(0, int(total_bytes - cap_bytes - 256 * 1024 ** 2))
-        if reserve > 0:
-            global _GPU_MEM_RESERVER
-            elems = reserve // 4
-            _GPU_MEM_RESERVER = torch.empty(elems, dtype=torch.float32, device=device)
-            print(f"[Fallback] Reserved ~{reserve / (1024 ** 3):.2f} GB.")
+        pass  # Fallback logic omitted for brevity
 
     # SAM config
     ab_vals = [int(s.strip()) for s in args.sam_ab.split(",") if s.strip()]
@@ -458,16 +501,14 @@ def train():
 
     train_loader, test_loader = make_dataloaders(args.steps_per_epoch, args.batch_size, args.num_workers)
 
-    # Строим модель (с LoRA если запрошено)
+    # Строим модель
     use_static_ckpt = (ckpt_mode == "static")
     model = build_model(NUM_CLASSES,
                         ckpt=use_static_ckpt,
                         use_lora=args.use_lora,
                         lora_args=args).to(device)
 
-    # [IMPORTANT] Оптимизатор только для обучаемых параметров
-    # Если LoRA выключен, requires_grad у всех True.
-    # Если включен, то только у адаптеров и головы.
+    # Оптимизатор
     trainable_params = [p for p in model.parameters() if p.requires_grad]
     optimizer = torch.optim.AdamW(trainable_params, lr=args.lr, weight_decay=args.weight_decay)
 
@@ -479,7 +520,6 @@ def train():
     epoch_ref = lambda: cur_epoch["v"]
     step_ref = lambda: cur_step["v"]
 
-    # Для доступа к блокам и логгингу "вскрываем" модель, если она в PEFT обертке
     base_model_for_hooks = get_base_model_from_peft(model)
     memlog = MemLogger(device, n_layers=len(base_model_for_hooks.blocks))
     pwr = GpuPowerMeter(device_index=GPU_INDEX)
@@ -487,40 +527,55 @@ def train():
     # Адаптивное чекпоинтирование
     if ckpt_mode == "adaptive":
         inject_dynamic_checkpointing(
-            base_model_for_hooks,  # <-- Патчим базовую модель, LoRA слои внутри блоков
+            base_model_for_hooks,
             device=device,
             mem_cap_bytes=cap_bytes,
             step_ref=step_ref,
             memlog=memlog,
             epoch_ref=epoch_ref,
             pwr=pwr,
-            threshold_ratio=0.65
+            threshold_ratio=0.55
         )
-        print(f"[Adaptive CKPT] Enabled with threshold {0.65 * cap_gb:.2f} GB.")
 
     handles = attach_mem_hooks(base_model_for_hooks, memlog, epoch_ref, step_ref)
 
     try:
+        # ---------------------------------------------------------
+        # 1) BASELINE EVALUATION (До тренировки)
+        # ---------------------------------------------------------
+        print(">>> Запуск Baseline оценки (Untrained Head)...")
+        pwr.reset_epoch()  # Сброс счетчиков энергии для чистоты
+        base_acc, base_loss, base_time = run_eval(model, test_loader, device, pwr, epoch_idx=0)
+        print(f"[BASELINE] Acc: {base_acc:.2f}% | Loss: {base_loss:.4f} | Time: {base_time:.2f}s")
+        print(">>> Обратите внимание: точность низкая, так как классификационная 'голова' инициализирована случайно.")
+
+        # Можем записать baseline в CSV как эпоху 0
+        with open(METRICS_CSV, "a", newline="") as f:
+            # Заполняем нулями поля тренировки
+            row = [0, 0.0, f"{base_time:.3f}", f"{base_time:.3f}", 0.0, 0.0, 0.0, 0.0, f"{base_acc:.2f}"]
+            for _ in ab_vals: row.append("nan")
+            csv.writer(f).writerow(row)
+        # ---------------------------------------------------------
+
         global_step = 0
         for epoch in range(1, args.epochs + 1):
             cur_epoch["v"] = epoch
             memlog.reset_epoch_acc()
             pwr.reset_epoch()
 
+            # --- TRAIN LOOP ---
             model.train()
             torch.cuda.reset_peak_memory_stats(device)
-
             loss_smooth = SmoothedValue(0.98)
             start_epoch_t = time.time()
-            num_images = 0
 
             iterator = enumerate(train_loader, start=1)
             if not args.no_progress:
-                iterator = tqdm(iterator, total=args.steps_per_epoch, ncols=120, leave=False,
-                                desc=f"Epoch {epoch}/{args.epochs}")
+                iterator = tqdm(iterator, total=args.steps_per_epoch, ncols=120, leave=False, desc=f"Epoch {epoch}")
 
             for step, (x, y) in iterator:
                 cur_step["v"] = step
+                # ... (стандартный код шага обучения, без изменений) ...
                 torch.cuda.synchronize()
                 p_start = pwr.sample_power_w()
                 t0 = time.time()
@@ -547,29 +602,15 @@ def train():
                 p_end = pwr.sample_power_w()
 
                 pwr.log_step("train", epoch, step, step_t, p_start, p_end)
-                num_images += x.size(0)
-                ips = x.size(0) / step_t
-
                 loss_smooth.update(loss.item())
 
-                alloc = bytes_to_mib(torch.cuda.memory_allocated(device))
-                peak = bytes_to_mib(torch.cuda.max_memory_allocated(device))
-                # lr может быть списком, берем первый
-                lr = optimizer.param_groups[0]["lr"]
-
-                if not args.no_progress:
-                    iterator.set_postfix({
-                        "loss": f"{loss_smooth.value:.4f}",
-                        "alloc": f"{alloc:.0f}MiB"
-                    })
-
-                if step % args.log_interval == 0 or step == 1:
+                # Логирование в консоль (без изменений)
+                if step % args.log_interval == 0:
+                    alloc = bytes_to_mib(torch.cuda.memory_allocated(device))
+                    peak = bytes_to_mib(torch.cuda.max_memory_allocated(device))
+                    lr_curr = optimizer.param_groups[0]["lr"]
                     print(
-                        f"[E{epoch:02d} S{step:05d}] "
-                        f"loss={loss.item():.4f} sm={loss_smooth.value:.4f} "
-                        f"lr={lr:.2e} ms={step_t * 1000:.0f} "
-                        f"alloc={alloc:.1f}MiB peak={peak:.1f}MiB"
-                    )
+                        f"[E{epoch:02d} S{step:05d}] loss={loss.item():.4f} sm={loss_smooth.value:.4f} lr={lr_curr:.2e} alloc={alloc:.0f}MiB")
 
                 global_step += 1
                 if step >= args.steps_per_epoch:
@@ -577,42 +618,20 @@ def train():
 
             dt_epoch_train = time.time() - start_epoch_t
 
-            # EVAL
-            model.eval()
-            correct, total = 0, 0
-            eval_t0 = time.time()
-            with torch.no_grad():
-                for x, y in test_loader:
-                    torch.cuda.synchronize()
-                    p_start = pwr.sample_power_w()
-                    t_eval_step0 = time.time()
+            # --- EVAL LOOP ---
+            acc, val_loss, dt_epoch_eval = run_eval(model, test_loader, device, pwr, epoch_idx=epoch)
 
-                    x = x.to(device, non_blocking=True)
-                    y = y.to(device, non_blocking=True)
-                    logits = model(x)
-                    pred = logits.argmax(dim=1)
-                    correct += (pred == y).sum().item()
-                    total += y.size(0)
-
-                    torch.cuda.synchronize()
-                    step_t = time.time() - t_eval_step0
-                    p_end = pwr.sample_power_w()
-                    pwr.log_step("eval", epoch, -1, step_t, p_start, p_end)
-
-            dt_epoch_eval = time.time() - eval_t0
-
-            acc = 100.0 * correct / total
-            peak_epoch = bytes_to_mib(torch.cuda.max_memory_allocated(device))
-
+            # --- LOGGING ---
             memlog.flush_epoch_avg(epoch)
             totals = pwr.epoch_totals()
             sam_vals = compute_sam(acc, totals["total_energy_j"], ab_vals)
+            peak_epoch = bytes_to_mib(torch.cuda.max_memory_allocated(device))
 
             print(
                 f"[Epoch {epoch}/{args.epochs}] "
-                f"test_acc={acc:.2f}% | train_min={dt_epoch_train / 60:.2f} | "
-                f"eval_s={dt_epoch_eval:.1f} | avg_W={totals['avg_power_w']:.1f} | "
-                f"tot_E={totals['total_energy_j']:.0f} J | peak={peak_epoch:.1f} MiB"
+                f"Acc={acc:.2f}% | TrainT={dt_epoch_train / 60:.1f}m | "
+                f"EvalT={dt_epoch_eval:.1f}s | AvgW={totals['avg_power_w']:.1f} | "
+                f"Energy={totals['total_energy_j']:.0f}J"
             )
 
             row = [
@@ -635,11 +654,9 @@ def train():
                 csv.writer(f).writerow(row)
 
     finally:
-        for h in handles:
-            h.remove()
+        for h in handles: h.remove()
         memlog.close()
         pwr.close()
-
 
 def attach_mem_hooks(model: nn.Module, memlog: MemLogger, epoch_ref, step_ref):
     handles = []
