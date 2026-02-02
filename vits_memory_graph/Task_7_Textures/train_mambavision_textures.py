@@ -296,84 +296,106 @@ def get_base_model_from_peft(model):
 def get_mamba_blocks(model) -> list:
     """
     Извлекает Mamba/Transformer блоки из MambaVision модели.
-    
-    MambaVision структура:
-    - levels[0-1]: Conv блоки (пропускаем)
-    - levels[2-3]: Mamba + Transformer блоки (применяем checkpointing)
-    
-    Возвращает только блоки из stage 3-4 (Mamba + Transformer).
+    Исправленная версия: предотвращает дубликаты.
     """
     base = get_base_model_from_peft(model)
-    
     blocks = []
+    seen_ids = set()
     
-    # MambaVision использует 'levels' для stages
-    if hasattr(base, 'levels'):
-        for level_idx, level in enumerate(base.levels):
-            # Пропускаем Conv stages (0, 1) - они не нуждаются в checkpointing
-            if level_idx < 2:
-                continue
+    # Remove debug prints
+
+    def add_block(b):
+        if id(b) not in seen_ids:
+            blocks.append(b)
+            seen_ids.add(id(b))
+
+    # Попытка развернуть HF модель (например, MambaVisionModelForImageClassification -> base.model / base.backbone)
+    inner_model = base
+    if hasattr(base, 'model'):
+        inner_model = base.model
+    elif hasattr(base, 'backbone'):
+        inner_model = base.backbone
+    elif hasattr(base, 'mambavision'):
+        inner_model = base.mambavision
+
+    def check_and_add(container):
+        if hasattr(container, 'blocks'):
+            for b in container.blocks:
+                add_block(b)
+        elif hasattr(container, 'transformer') and hasattr(container.transformer, 'blocks'):
+            for b in container.transformer.blocks:
+                add_block(b)
+
+    # 1. MambaVision структура: levels -> blocks
+    if hasattr(inner_model, 'levels'):
+        for level_idx, level in enumerate(inner_model.levels):
+            if level_idx < 2: continue # Skip conv stages
+            check_and_add(level)
+    
+    # 2. Timm style: stages -> blocks
+    elif hasattr(inner_model, 'stages'):
+        for stage_idx, stage in enumerate(inner_model.stages):
+            if stage_idx < 2: continue
+            check_and_add(stage)
             
-            # Stage 3-4: содержат Mamba и Transformer блоки
-            if hasattr(level, 'blocks'):
-                for block in level.blocks:
-                    blocks.append(block)
-            elif hasattr(level, 'transformer') and hasattr(level.transformer, 'blocks'):
-                for block in level.transformer.blocks:
-                    blocks.append(block)
-            # Если level сам является блоком
-            elif hasattr(level, 'mixer') or hasattr(level, 'attn'):
-                blocks.append(level)
-    
-    # Альтернативная структура: прямой доступ к stages
-    elif hasattr(base, 'stages'):
-        for stage_idx, stage in enumerate(base.stages):
-            if stage_idx < 2:
-                continue
-            if hasattr(stage, 'blocks'):
-                for block in stage.blocks:
-                    blocks.append(block)
-    
-    # Fallback: ищем blocks напрямую
-    elif hasattr(base, 'blocks'):
-        blocks = list(base.blocks)
-    
-    if not blocks:
-        # Попробуем найти все модули с 'mixer' или внутри levels
-        for name, module in base.named_modules():
-            if 'level' in name.lower() and ('block' in name.lower() or 'mixer' in name.lower()):
-                # Проверяем что это блок из stage 3-4
-                if 'level.2' in name or 'level.3' in name or 'levels.2' in name or 'levels.3' in name:
-                    if hasattr(module, 'forward') and module not in blocks:
-                        blocks.append(module)
-    
+    # 3. Flat blocks
+    elif hasattr(inner_model, 'blocks'):
+        for b in inner_model.blocks:
+            add_block(b)
+            
+    # 4. Layers (generic)
+    elif hasattr(inner_model, 'layers'):
+        for i, layer in enumerate(inner_model.layers):
+            if i < 2: continue
+            check_and_add(layer)
+
     return blocks
 
 
 def get_all_blocks_for_hooks(model) -> list:
     """
     Получает ВСЕ блоки модели для хуков (включая conv stages).
-    Используется для мониторинга памяти.
     """
     base = get_base_model_from_peft(model)
     blocks = []
-    
-    if hasattr(base, 'levels'):
-        for level in base.levels:
-            if hasattr(level, 'blocks'):
-                for block in level.blocks:
-                    blocks.append(block)
-            elif hasattr(level, 'mixer') or hasattr(level, 'attn'):
-                blocks.append(level)
-    elif hasattr(base, 'stages'):
-        for stage in base.stages:
-            if hasattr(stage, 'blocks'):
-                for block in stage.blocks:
-                    blocks.append(block)
-    elif hasattr(base, 'blocks'):
-        blocks = list(base.blocks)
+    seen_ids = set()
+
+    def add_block(b):
+        if id(b) not in seen_ids:
+            blocks.append(b)
+            seen_ids.add(id(b))
+
+    inner_model = base
+    if hasattr(base, 'model'):
+        inner_model = base.model
+    elif hasattr(base, 'backbone'):
+        inner_model = base.backbone
+    elif hasattr(base, 'mambavision'):
+        inner_model = base.mambavision
+
+    def check_and_add(container):
+        if hasattr(container, 'blocks'):
+            for b in container.blocks:
+                add_block(b)
+        elif hasattr(container, 'transformer') and hasattr(container.transformer, 'blocks'):
+            for b in container.transformer.blocks:
+                add_block(b)
+
+    if hasattr(inner_model, 'levels'):
+        for level in inner_model.levels:
+            check_and_add(level)
+    elif hasattr(inner_model, 'stages'):
+        for stage in inner_model.stages:
+            check_and_add(stage)
+    elif hasattr(inner_model, 'blocks'):
+        for b in inner_model.blocks:
+            add_block(b)
+    elif hasattr(inner_model, 'layers'):
+        for layer in inner_model.layers:
+            check_and_add(layer)
     
     return blocks
+
 
 
 # -------------------------------
@@ -607,10 +629,14 @@ class MemLogger:
         self.epoch_acc: Dict[Tuple[str, int], Tuple[float, int]] = {}
 
         self.time_file = gzip.open(self.layer_times_path, "at", newline="")
+
         self.time_writer = csv.writer(self.time_file)
         if self.layer_times_path.stat().st_size == 0:
             self.time_writer.writerow(["ts","epoch","step","phase","layer","ms"])
         self.epoch_time_acc: Dict[Tuple[str, int], Tuple[float, int]] = {}
+        
+        # Buffer for deferred timing
+        self.pending_events = [] 
 
         first = (not self.layer_time_epoch_avg_path.exists()) or (self.layer_time_epoch_avg_path.stat().st_size == 0)
         if first:
@@ -625,17 +651,36 @@ class MemLogger:
         total, cnt = self.epoch_acc.get(key, (0.0, 0))
         self.epoch_acc[key] = (total + bytes_to_mib(mem), cnt + 1)
 
-    def log_layer_time(self, epoch: int, step: int, phase: str, layer_idx: int, ms: float):
-        self.time_writer.writerow([iso_now(), epoch, step, phase, layer_idx, f"{ms:.3f}"])
-        key = (phase, layer_idx)
-        total, cnt = self.epoch_time_acc.get(key, (0.0, 0))
-        self.epoch_time_acc[key] = (total + ms, cnt + 1)
+    def buffer_layer_time(self, epoch: int, step: int, phase: str, layer_idx: int, start_ev, end_ev):
+        """Store events to process later (avoids blocking per-layer)"""
+        self.pending_events.append((epoch, step, phase, layer_idx, start_ev, end_ev))
+
+    def process_buffered_events(self):
+        """Sync and log all buffered timings"""
+        if not self.pending_events:
+            return
+        
+        # Sync once for all pending events
+        torch.cuda.synchronize()
+        
+        for epoch, step, phase, layer_idx, start, end in self.pending_events:
+            ms = start.elapsed_time(end)
+            self.time_writer.writerow([iso_now(), epoch, step, phase, layer_idx, f"{ms:.3f}"])
+            key = (phase, layer_idx)
+            total, cnt = self.epoch_time_acc.get(key, (0.0, 0))
+            self.epoch_time_acc[key] = (total + ms, cnt + 1)
+        
+        self.pending_events.clear()
 
     def reset_epoch_acc(self):
         self.epoch_acc.clear()
         self.epoch_time_acc.clear()
+        self.pending_events.clear()
 
     def flush_epoch_avg(self, epoch: int):
+        # Ensure everything is processed
+        self.process_buffered_events()
+        
         first_write = (not self.epoch_avg_path.exists()) or (self.epoch_avg_path.stat().st_size == 0)
         with open(self.epoch_avg_path, "a", newline="") as f:
             w = csv.writer(f)
@@ -768,11 +813,10 @@ def attach_mem_hooks(model: nn.Module, memlog: MemLogger, epoch_ref, step_ref):
         def _hook(module, inp, out):
             end = torch.cuda.Event(enable_timing=True)
             end.record(torch.cuda.current_stream())
-            end.synchronize()
+            # end.synchronize()  <-- removed to fix slowdown
             start = fwd_start_events.pop(layer_idx, None)
             if start is not None:
-                ms = start.elapsed_time(end)
-                memlog.log_layer_time(epoch_ref(), step_ref(), "fwd", layer_idx, ms)
+                memlog.buffer_layer_time(epoch_ref(), step_ref(), "fwd", layer_idx, start, end)
         return _hook
 
     have_bwd_pre = hasattr(nn.Module, "register_full_backward_pre_hook")
@@ -788,11 +832,13 @@ def attach_mem_hooks(model: nn.Module, memlog: MemLogger, epoch_ref, step_ref):
         def _hook(module, grad_input, grad_output):
             end = torch.cuda.Event(enable_timing=True)
             end.record(torch.cuda.current_stream())
-            end.synchronize()
+            # end.synchronize() <-- removed
             start = bwd_start_events.pop(layer_idx, None)
-            ms = start.elapsed_time(end) if start is not None else 0.0
+            # ms = start.elapsed_time(end) if start is not None else 0.0
+            if start is not None:
+                 memlog.buffer_layer_time(epoch_ref(), step_ref(), "bwd", layer_idx, start, end)
+            
             memlog.log_now(epoch_ref(), step_ref(), "bwd", layer_idx)
-            memlog.log_layer_time(epoch_ref(), step_ref(), "bwd", layer_idx, ms)
         return _hook
 
     # Получаем все блоки для хуков
@@ -879,9 +925,9 @@ def inject_dynamic_checkpointing(model: nn.Module, device: torch.device, mem_cap
                         b._in_recompute = was_flag
 
                     end_ev.record(torch.cuda.current_stream())
-                    end_ev.synchronize()
-                    ms = start_ev.elapsed_time(end_ev)
-                    memlog.log_layer_time(epoch_ref(), step_ref(), "fwd_re", layer_idx, ms)
+                    # end_ev.synchronize() <-- removed 
+                    # ms = start_ev.elapsed_time(end_ev)
+                    memlog.buffer_layer_time(epoch_ref(), step_ref(), "fwd_re", layer_idx, start_ev, end_ev)
 
                     if pwr is not None:
                         step_t = time.time() - t0
@@ -1103,6 +1149,9 @@ def train(args):
                 p_end = pwr.sample_power_w()
                 pwr.log_step("train", epoch, step, step_t, p_start, p_end)
                 loss_smooth.update(loss.item())
+
+                # Flush timing events for this step
+                memlog.process_buffered_events()
 
                 if step % args.log_interval == 0:
                     alloc = bytes_to_mib(torch.cuda.memory_allocated(device))
