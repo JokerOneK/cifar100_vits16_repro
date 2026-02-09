@@ -1,6 +1,6 @@
 import os, pandas as pd
 from train import build_model, make_loaders, train_one
-from bitfit import prepare_bitfit
+from legacy.bitfit import prepare_bitfit
 from lora_vit import prepare_lora
 
 USE_SAM = bool(int(os.getenv("SWEEP_USE_SAM", "0")))

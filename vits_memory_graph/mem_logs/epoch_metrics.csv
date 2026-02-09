@@ -1,0 +1,3 @@
+epoch,train_time_s,eval_time_s,total_time_s,train_energy_j,eval_energy_j,total_energy_j,avg_power_w,test_acc_pct,SAM_a1_b1,SAM_a2_b2,SAM_a3_b3,SAM_a4_b4,SAM_a5_b5
+0,0.0,131.927,131.927,0.0,0.0,0.0,0.0,0.64,nan,nan,nan,nan,nan
+1,523.291,110.719,634.010,81379.682,16308.788,97688.470,154.080,84.53,0.169413,0.028701,0.004862,0.000824,0.000140

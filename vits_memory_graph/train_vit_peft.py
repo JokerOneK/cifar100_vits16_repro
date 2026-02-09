@@ -96,34 +96,69 @@ def ensure_cuda():
 
 
 def make_dataloaders(steps_per_epoch: int, batch_size: int, num_workers: int):
+    """
+    Food-101:
+      - 101 классов
+      - split="train"/"test"
+      - high-res картинки (до 512 px), мы режем/ресайзим до 224 для ViT-S
+    """
+    img_size = 224
+
+    # ImageNet-нормализация (под ViT)
+    mean = (0.485, 0.456, 0.406)
+    std  = (0.229, 0.224, 0.225)
+
     train_tf = transforms.Compose([
-        transforms.RandomResizedCrop(224, scale=(0.8, 1.0)),
+        transforms.RandomResizedCrop(img_size, scale=(0.8, 1.0)),
         transforms.RandomHorizontalFlip(),
         transforms.ToTensor(),
-        transforms.Normalize(mean=(0.5071, 0.4867, 0.4408), std=(0.2675, 0.2565, 0.2761)),
+        transforms.Normalize(mean=mean, std=std),
     ])
     test_tf = transforms.Compose([
-        transforms.Resize(256),
-        transforms.CenterCrop(224),
+        transforms.Resize(int(img_size * 1.14)),  # ~256 для 224
+        transforms.CenterCrop(img_size),
         transforms.ToTensor(),
-        transforms.Normalize(mean=(0.5071, 0.4867, 0.4408), std=(0.2675, 0.2565, 0.2761)),
+        transforms.Normalize(mean=mean, std=std),
     ])
 
-    train_ds = datasets.CIFAR100(root="./data", train=True, transform=train_tf, download=True)
-    test_ds = datasets.CIFAR100(root="./data", train=False, transform=test_tf, download=True)
+    # === ВАЖНО: Food-101 вместо CIFAR-100 ===
+    train_ds = datasets.Food101(
+        root="../data",
+        split="train",
+        transform=train_tf,
+        download=False  # уже всё есть
+    )
+    test_ds = datasets.Food101(
+        root="../data",
+        split="test",
+        transform=test_tf,
+        download=False
+    )
 
+    # 101 классов, но берём из датасета на будущее
+    num_classes = len(train_ds.classes)
+
+    # Как и раньше: фиксируем steps_per_epoch через RandomSampler
     num_samples = steps_per_epoch * batch_size
     train_sampler = RandomSampler(train_ds, replacement=True, num_samples=num_samples)
 
     train_loader = DataLoader(
-        train_ds, batch_size=batch_size, sampler=train_sampler,
-        num_workers=num_workers, pin_memory=True, drop_last=True
+        train_ds,
+        batch_size=batch_size,
+        sampler=train_sampler,
+        num_workers=num_workers,
+        pin_memory=True,
+        drop_last=True,
     )
     test_loader = DataLoader(
-        test_ds, batch_size=256, shuffle=False,
-        num_workers=num_workers, pin_memory=True
+        test_ds,
+        batch_size=256,
+        shuffle=False,
+        num_workers=num_workers,
+        pin_memory=True,
     )
-    return train_loader, test_loader
+
+    return train_loader, test_loader, num_classes
 
 
 # [NEW] Функция для квантования timm модели in-place (для QLoRA)
@@ -591,11 +626,13 @@ def train():
     ab_vals = sorted(set([v for v in ab_vals if v >= 1]))
     ensure_metrics_csv_header(ab_vals)
 
-    train_loader, test_loader = make_dataloaders(args.steps_per_epoch, args.batch_size, args.num_workers)
+    train_loader, test_loader, num_classes = make_dataloaders(
+        args.steps_per_epoch, args.batch_size, args.num_workers
+    )
 
     # Строим модель с учетом PEFT метода
     use_static_ckpt = (ckpt_mode == "static")
-    model = build_model(NUM_CLASSES,
+    model = build_model(num_classes,
                         ckpt=use_static_ckpt,
                         peft_method=args.peft_method,
                         lora_args=args).to(device)

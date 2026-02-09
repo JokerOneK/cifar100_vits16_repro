@@ -1,0 +1,8 @@
+/.venv/*
+/data/*
+/vits_memory_graph/data/*
+/vits_memory_graph/Task_7_Textures/data/*
+/vits_memory_graph/Task_7_Textures/venv/*
+/vits_memory_graph/Task_7_Textures/venv_mamba/*
+
+\vits_memory_graph\data\*
