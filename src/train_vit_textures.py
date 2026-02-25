@@ -5,7 +5,8 @@ KAGGLE_WORKING = "/kaggle/working"
 KAGGLE_INPUT = "/kaggle/input"
 
 # Оптимизация аллокатора памяти
-os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True,max_split_size_mb:128,garbage_collection_threshold:0.8"
+# NOTE: expandable_segments:True нельзя использовать вместе с set_per_process_memory_fraction()
+os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "max_split_size_mb:128,garbage_collection_threshold:0.8"
 
 import math
 import time
@@ -16,6 +17,7 @@ from pathlib import Path
 from typing import List, Dict, Tuple
 from datetime import datetime
 import copy
+import traceback
 
 from torch.utils.checkpoint import checkpoint
 
@@ -46,7 +48,7 @@ except ImportError:
 # -------------------------------
 EPOCHS = 10
 STEPS_PER_EPOCH = 782
-BATCH_SIZE = 64
+BATCH_SIZE = 32
 NUM_WORKERS = 2  # Kaggle обычно стабильно на 2-4
 MODEL_NAME = "vit_small_patch16_224"
 SEED = 42
@@ -85,7 +87,7 @@ def ensure_cuda():
 # -------------------------------
 # DTD Dataloaders
 # -------------------------------
-def make_dataloaders_dtd(steps_per_epoch: int, batch_size: int, num_workers: int, data_root: str, download: bool):
+def make_dataloaders_dtd(steps_per_epoch: int, batch_size: int, num_workers: int, data_root: str, download: bool, eval_batch_size: int = 64):
     """
     DTD (Describable Textures Dataset)
     split: train/val/test
@@ -135,12 +137,54 @@ def make_dataloaders_dtd(steps_per_epoch: int, batch_size: int, num_workers: int
     )
     test_loader = DataLoader(
         test_ds,
-        batch_size=256,
+        batch_size=eval_batch_size,
         shuffle=False,
         num_workers=num_workers,
         pin_memory=True,
     )
 
+    return train_loader, test_loader, num_classes
+
+
+def make_dataloaders_cifar100(steps_per_epoch: int, batch_size: int, num_workers: int, data_root: str, download: bool, eval_batch_size: int = 64):
+    """
+    CIFAR-100: 100 классов, 50k train / 10k test
+    Resize 32→224 для ViT patch16
+    """
+    img_size = 224
+    mean = (0.485, 0.456, 0.406)
+    std  = (0.229, 0.224, 0.225)
+
+    train_tf = transforms.Compose([
+        transforms.Resize((img_size, img_size)),
+        transforms.RandomHorizontalFlip(),
+        transforms.ToTensor(),
+        transforms.Normalize(mean=mean, std=std),
+    ])
+    test_tf = transforms.Compose([
+        transforms.Resize((img_size, img_size)),
+        transforms.ToTensor(),
+        transforms.Normalize(mean=mean, std=std),
+    ])
+
+    root = Path(data_root)
+    root.mkdir(parents=True, exist_ok=True)
+
+    train_ds = datasets.CIFAR100(root=str(root), train=True,  transform=train_tf, download=download)
+    test_ds  = datasets.CIFAR100(root=str(root), train=False, transform=test_tf,  download=download)
+    num_classes = 100
+
+    num_samples = steps_per_epoch * batch_size
+    train_sampler = RandomSampler(train_ds, replacement=True, num_samples=num_samples)
+
+    train_loader = DataLoader(
+        train_ds, batch_size=batch_size, sampler=train_sampler,
+        num_workers=num_workers, pin_memory=True, drop_last=True,
+    )
+    test_loader = DataLoader(
+        test_ds, batch_size=eval_batch_size, shuffle=False,
+        num_workers=num_workers, pin_memory=True,
+    )
     return train_loader, test_loader, num_classes
 
 
@@ -371,6 +415,9 @@ class MemLogger:
             self.time_writer.writerow(["ts","epoch","step","phase","layer","ms"])
         self.epoch_time_acc: Dict[Tuple[str, int], Tuple[float, int]] = {}
 
+        # Buffer for deferred timing (avoids GPU sync per-layer)
+        self.pending_events = []
+
         first = (not self.layer_time_epoch_avg_path.exists()) or (self.layer_time_epoch_avg_path.stat().st_size == 0)
         if first:
             with open(self.layer_time_epoch_avg_path, "a", newline="") as f:
@@ -390,11 +437,32 @@ class MemLogger:
         total, cnt = self.epoch_time_acc.get(key, (0.0, 0))
         self.epoch_time_acc[key] = (total + ms, cnt + 1)
 
+    def buffer_layer_time(self, epoch: int, step: int, phase: str, layer_idx: int, start_ev, end_ev):
+        """Store events to process later (avoids blocking per-layer)"""
+        self.pending_events.append((epoch, step, phase, layer_idx, start_ev, end_ev))
+
+    def process_buffered_events(self):
+        """Sync and log all buffered timings"""
+        if not self.pending_events:
+            return
+        torch.cuda.synchronize()
+        for epoch, step, phase, layer_idx, start, end in self.pending_events:
+            ms = start.elapsed_time(end)
+            self.time_writer.writerow([iso_now(), epoch, step, phase, layer_idx, f"{ms:.3f}"])
+            key = (phase, layer_idx)
+            total, cnt = self.epoch_time_acc.get(key, (0.0, 0))
+            self.epoch_time_acc[key] = (total + ms, cnt + 1)
+        self.pending_events.clear()
+
     def reset_epoch_acc(self):
         self.epoch_acc.clear()
         self.epoch_time_acc.clear()
+        self.pending_events.clear()
 
     def flush_epoch_avg(self, epoch: int):
+        # Ensure everything is processed
+        self.process_buffered_events()
+
         first_write = (not self.epoch_avg_path.exists()) or (self.epoch_avg_path.stat().st_size == 0)
         with open(self.epoch_avg_path, "a", newline="") as f:
             w = csv.writer(f)
@@ -601,9 +669,8 @@ def inject_dynamic_checkpointing(model: nn.Module, device: torch.device, mem_cap
                         b._in_recompute = was_flag
 
                     end_ev.record(torch.cuda.current_stream())
-                    end_ev.synchronize()
-                    ms = start_ev.elapsed_time(end_ev)
-                    memlog.log_layer_time(epoch_ref(), step_ref(), "fwd_re", layer_idx, ms)
+                    # Deferred sync: buffer events instead of blocking GPU pipeline
+                    memlog.buffer_layer_time(epoch_ref(), step_ref(), "fwd_re", layer_idx, start_ev, end_ev)
 
                     if pwr is not None:
                         step_t = time.time() - t0
@@ -619,27 +686,37 @@ def inject_dynamic_checkpointing(model: nn.Module, device: torch.device, mem_cap
 
 
 def parse_args():
-    ap = argparse.ArgumentParser()
+    ap = argparse.ArgumentParser(
+        description="Train ViT-S/16 on DTD/CIFAR-100 with PEFT methods and adaptive checkpointing"
+    )
     ap.add_argument("--epochs", type=int, default=EPOCHS)
     ap.add_argument("--steps-per-epoch", type=int, default=STEPS_PER_EPOCH)
     ap.add_argument("--batch-size", type=int, default=BATCH_SIZE)
     ap.add_argument("--num-workers", type=int, default=NUM_WORKERS)
-    ap.add_argument("--lr", type=float, default=5e-4)
+    ap.add_argument("--lr", type=float, default=5e-4, help="Learning rate for PEFT methods")
+    ap.add_argument("--lr-fullft", type=float, default=1e-4, help="Learning rate for full fine-tuning (peft=none)")
     ap.add_argument("--weight-decay", type=float, default=0.05)
     ap.add_argument("--log-interval", type=int, default=200)
+    ap.add_argument("--eval-batch-size", type=int, default=64, help="Batch size for evaluation")
     ap.add_argument("--no-progress", action="store_true")
     ap.add_argument("--amp", action="store_true")
     ap.add_argument("--gpu-index", type=int, default=GPU_INDEX)
 
     ap.add_argument("--sam-ab", type=str, default="1,2,3,4,5")
-    ap.add_argument("--ckpt-mode", type=str, default="adaptive", choices=["none","static","adaptive"])
+
+    # --- Multi-experiment matrix ---
+    ap.add_argument("--datasets", type=str, nargs="+", default=["cifar100", "dtd"],
+                    choices=["cifar100", "dtd"], help="Datasets to run")
+    ap.add_argument("--ckpt-modes", type=str, nargs="+", default=["none", "static", "adaptive"],
+                    choices=["none", "static", "adaptive"], help="Checkpointing modes")
+    ap.add_argument("--peft-methods", type=str, nargs="+",
+                    default=["none", "bitfit", "lora", "adalora", "qlora"],
+                    choices=["none", "lora", "qlora", "adalora", "bitfit"],
+                    help="PEFT methods to run")
 
     ap.add_argument("--outdir", type=str, default=str(DEFAULT_OUTDIR))
     ap.add_argument("--data-root", type=str, default=str(DEFAULT_DATA_ROOT))
-    ap.add_argument("--download", action="store_true", help="Download DTD dataset (needs Kaggle Internet=On)")
-
-    ap.add_argument("--peft-method", type=str, default="none",
-                    choices=["none","lora","qlora","adalora","bitfit","all"])
+    ap.add_argument("--download", action="store_true", help="Download datasets if needed")
 
     ap.add_argument("--lora-r", type=int, default=8)
     ap.add_argument("--lora-alpha", type=int, default=16)
@@ -656,26 +733,36 @@ def parse_args():
     return ap.parse_args()
 
 
-def train(args):
+def train_single_run(args, dataset: str, peft_method: str, ckpt_mode: str):
+    """
+    Train a single experiment configuration.
+    Called from main() for each (dataset, peft_method, ckpt_mode) combination.
+    """
+    run_tag = f"{dataset}/{peft_method}_{ckpt_mode}"
+    print(f"\n{'=' * 80}")
+    print(f"STARTING: {run_tag}")
+    print(f"{'=' * 80}")
     set_seed(SEED)
     device = ensure_cuda()
 
-    # ---- GPU memory cap ----
+    # ---- GPU memory cap (only for adaptive checkpointing) ----
     total_bytes = torch.cuda.get_device_properties(args.gpu_index).total_memory
     cap_bytes = int(max(0.1, MEMORY_CAPACITY_GB) * (1024**3))
     try:
-        frac = min(0.99, cap_bytes / total_bytes)
-        torch.cuda.set_per_process_memory_fraction(frac, device=args.gpu_index)
-        print(f"[GPU MEM CAP] Limiting allocator to ~{MEMORY_CAPACITY_GB:.2f} GB ({frac*100:.1f}%).")
+        if ckpt_mode == "adaptive":
+            frac = min(0.99, cap_bytes / total_bytes)
+            torch.cuda.set_per_process_memory_fraction(frac, device=args.gpu_index)
+            print(f"[GPU MEM CAP] Limiting allocator to ~{MEMORY_CAPACITY_GB:.2f} GB ({frac*100:.1f}%) for adaptive checkpointing.")
+        else:
+            torch.cuda.set_per_process_memory_fraction(0.99, device=args.gpu_index)
+            print(f"[GPU MEM] No cap — using full GPU memory (ckpt_mode={ckpt_mode}).")
     except Exception:
         pass
 
     ab_vals = sorted(set(int(s) for s in args.sam_ab.split(",") if s.strip()))
 
     outdir_base = Path(args.outdir)
-    outdir_base.mkdir(parents=True, exist_ok=True)
-    run_name = f"{args.peft_method}_{args.ckpt_mode}"
-    run_dir = outdir_base / run_name
+    run_dir = outdir_base / dataset / f"{peft_method}_{ckpt_mode}"
     run_dir.mkdir(parents=True, exist_ok=True)
     print(f"[RUN DIR] {run_dir}")
 
@@ -688,23 +775,38 @@ def train(args):
 
     ensure_metrics_csv_header(ab_vals, metrics_csv_path)
 
-    train_loader, test_loader, num_classes = make_dataloaders_dtd(
-        args.steps_per_epoch, args.batch_size, args.num_workers,
-        data_root=args.data_root,
-        download=args.download,
-    )
-    print(f"[DTD] num_classes={num_classes}")
+    # --- Dataset ---
+    if dataset == "cifar100":
+        train_loader, test_loader, num_classes = make_dataloaders_cifar100(
+            args.steps_per_epoch, args.batch_size, args.num_workers,
+            data_root=args.data_root, download=args.download,
+            eval_batch_size=args.eval_batch_size,
+        )
+        print(f"[CIFAR-100] num_classes={num_classes}")
+    else:
+        train_loader, test_loader, num_classes = make_dataloaders_dtd(
+            args.steps_per_epoch, args.batch_size, args.num_workers,
+            data_root=args.data_root, download=args.download,
+            eval_batch_size=args.eval_batch_size,
+        )
+        print(f"[DTD] num_classes={num_classes}")
 
-    use_static_ckpt = (args.ckpt_mode == "static")
-    model = build_model(num_classes, ckpt=use_static_ckpt, peft_method=args.peft_method, args=args).to(device)
+    # --- Model ---
+    use_static_ckpt = (ckpt_mode == "static")
+    model = build_model(num_classes, ckpt=use_static_ckpt, peft_method=peft_method, args=args).to(device)
+
+    # --- LR: lower for full fine-tuning ---
+    lr = args.lr_fullft if peft_method == "none" else args.lr
+    print(f"[LR] {lr:.1e} ({'FullFT' if peft_method == 'none' else peft_method})")
 
     trainable_params = [p for p in model.parameters() if p.requires_grad]
-    optimizer = torch.optim.AdamW(trainable_params, lr=args.lr, weight_decay=args.weight_decay)
+    optimizer = torch.optim.AdamW(trainable_params, lr=lr, weight_decay=args.weight_decay)
     criterion = nn.CrossEntropyLoss()
     scaler = torch.cuda.amp.GradScaler(enabled=args.amp)
 
     cur_epoch = {"v": 0}
     cur_step = {"v": 0}
+    global_step = {"v": 0}
     epoch_ref = lambda: cur_epoch["v"]
     step_ref = lambda: cur_step["v"]
 
@@ -712,7 +814,7 @@ def train(args):
     memlog = MemLogger(device, len(base_model_for_hooks.blocks), raw_log_gz, epoch_avg_csv, layer_times_gz, layer_time_epoch_avg_csv)
     pwr = GpuPowerMeter(device_index=args.gpu_index, step_energy_path=step_energy_gz)
 
-    if args.ckpt_mode == "adaptive":
+    if ckpt_mode == "adaptive":
         inject_dynamic_checkpointing(
             base_model_for_hooks, device=device, mem_cap_bytes=cap_bytes,
             step_ref=step_ref, memlog=memlog, epoch_ref=epoch_ref,
@@ -761,19 +863,31 @@ def train(args):
                         out = model(x)
                         loss = criterion(out, y)
                     scaler.scale(loss).backward()
-                    scaler.step(optimizer)
-                    scaler.update()
                 else:
                     out = model(x)
                     loss = criterion(out, y)
                     loss.backward()
+
+                # AdaLoRA: update rank budget after backward, before step
+                if peft_method == "adalora" and hasattr(model, "base_model") and hasattr(model.base_model, "update_and_allocate"):
+                    model.base_model.update_and_allocate(global_step["v"])
+
+                if args.amp:
+                    scaler.step(optimizer)
+                    scaler.update()
+                else:
                     optimizer.step()
+
+                global_step["v"] += 1
 
                 torch.cuda.synchronize()
                 step_t = time.time() - t0
                 p_end = pwr.sample_power_w()
                 pwr.log_step("train", epoch, step, step_t, p_start, p_end)
                 loss_smooth.update(loss.item())
+
+                # Flush deferred timing events
+                memlog.process_buffered_events()
 
                 if step % args.log_interval == 0:
                     alloc = bytes_to_mib(torch.cuda.memory_allocated(device))
@@ -820,17 +934,60 @@ def train(args):
         pwr.close()
         torch.cuda.empty_cache()
 
+    print(f"\n[DONE] {run_tag}")
+
+
+def main():
+    args = parse_args()
+
+    datasets_list = args.datasets
+    peft_list = args.peft_methods
+    ckpt_list = args.ckpt_modes
+
+    total_runs = len(datasets_list) * len(peft_list) * len(ckpt_list)
+    print(f"\n{'#' * 80}")
+    print(f"EXPERIMENT MATRIX: {len(datasets_list)} datasets × {len(peft_list)} PEFT × {len(ckpt_list)} ckpt = {total_runs} runs")
+    print(f"  Datasets:  {datasets_list}")
+    print(f"  PEFT:      {peft_list}")
+    print(f"  Ckpt:      {ckpt_list}")
+    print(f"  LR (PEFT): {args.lr}  |  LR (FullFT): {args.lr_fullft}")
+    print(f"  Outdir:    {args.outdir}")
+    print(f"{'#' * 80}\n")
+
+    completed = 0
+    failed = 0
+    failed_runs = []
+
+    for ds in datasets_list:
+        for peft in peft_list:
+            for ckpt in ckpt_list:
+                run_tag = f"{ds}/{peft}_{ckpt}"
+                run_idx = completed + failed + 1
+                print(f"\n>>> [{run_idx}/{total_runs}] {run_tag}")
+                try:
+                    train_single_run(args, dataset=ds, peft_method=peft, ckpt_mode=ckpt)
+                    completed += 1
+                except Exception as e:
+                    failed += 1
+                    failed_runs.append(run_tag)
+                    print(f"\n[ERROR] Run '{run_tag}' failed: {e}")
+                    traceback.print_exc()
+                    print(f"[SKIP] Continuing to next configuration...\n")
+                    # Очистка GPU памяти перед следующим запуском
+                    torch.cuda.empty_cache()
+                    continue
+
+    # --- Final Summary ---
+    print(f"\n{'#' * 80}")
+    print(f"EXPERIMENT MATRIX COMPLETE")
+    print(f"  Completed: {completed}/{total_runs}")
+    print(f"  Failed:    {failed}/{total_runs}")
+    if failed_runs:
+        print(f"  Failed runs:")
+        for r in failed_runs:
+            print(f"    - {r}")
+    print(f"{'#' * 80}")
+
 
 if __name__ == "__main__":
-    args = parse_args()
-    if args.peft_method == "all":
-        methods = ["none", "bitfit", "lora", "adalora", "qlora"]
-        for m in methods:
-            print("=" * 80)
-            print(f"Training PEFT method: {m}")
-            print("=" * 80)
-            args_run = copy.deepcopy(args)
-            args_run.peft_method = m
-            train(args_run)
-    else:
-        train(args)
+    main()
