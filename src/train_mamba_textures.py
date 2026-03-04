@@ -87,6 +87,20 @@ def ensure_cuda():
 # Vision Mamba (Vim) Implementation
 # -------------------------------
 
+class RMSNorm(nn.Module):
+    """Root Mean Square Layer Normalization (matches mamba_ssm's RMSNorm)"""
+    def __init__(self, d_model: int, eps: float = 1e-5, **kwargs):
+        super().__init__()
+        self.eps = eps
+        self.weight = nn.Parameter(torch.ones(d_model))
+
+    def forward(self, x):
+        dtype = x.dtype
+        x = x.float()
+        norm = torch.rsqrt(x.pow(2).mean(-1, keepdim=True) + self.eps)
+        return (x * norm).to(dtype) * self.weight
+
+
 class PatchEmbed(nn.Module):
     """ 2D Image to Patch Embedding """
 
@@ -201,8 +215,8 @@ class BiMamba(nn.Module):
         x_b = nn.functional.silu(x_b)
         y_b = self.ssm(x_b, self.x_proj_b, self.dt_proj_b, self.A_b_log, self.D_b)
 
-        # Sum forward and flipped-backward
-        y = y_f + y_b.flip([-1])
+        # Average forward and flipped-backward (if_divide_out=True, matches official Vim)
+        y = (y_f + y_b.flip([-1])) / 2.0
 
         z = nn.functional.silu(z.transpose(1, 2))
         y = y * z
@@ -239,12 +253,10 @@ class BiMamba(nn.Module):
 
 
 class VimBlock(nn.Module):
-    def __init__(self, dim, d_state=16, d_conv=4, expand=2, bidirectional=False):
+    def __init__(self, dim, d_state=16, d_conv=4, expand=2, bidirectional=False, drop_path=0.):
         super().__init__()
-        # Pretrained Vim weights use LayerNorm with NO BIAS
-        # However, keep standard epsilon. Checkpoints usually have eps=1e-5 or 1e-6.
-        # Vim-Small usually default to 1e-6.
-        self.norm = nn.LayerNorm(dim, eps=1e-6, bias=False)
+        # Official Vim uses RMSNorm with eps=1e-5, no bias
+        self.norm = RMSNorm(dim, eps=1e-5)
 
         if bidirectional:
             self.mixer = BiMamba(
@@ -254,8 +266,6 @@ class VimBlock(nn.Module):
                 expand=expand,
             )
         elif MAMBA_AVAILABLE:
-            # Fallback to standard Mamba for pure training from scratch if requested
-            # configuration for standard Mamba in mamba_ssm
             self.mixer = Mamba(
                 d_model=dim,
                 d_state=d_state,
@@ -265,8 +275,11 @@ class VimBlock(nn.Module):
         else:
             self.mixer = nn.Identity()
 
+        from timm.layers import DropPath
+        self.drop_path = DropPath(drop_path) if drop_path > 0. else nn.Identity()
+
     def forward(self, x):
-        x = x + self.mixer(self.norm(x))
+        x = x + self.drop_path(self.mixer(self.norm(x)))
         return x
 
 
@@ -281,7 +294,7 @@ class VisionMamba(nn.Module):
                  expand=2,
                  num_classes=100,
                  drop_rate=0.,
-                 drop_path_rate=0.1,
+                 drop_path_rate=0.0,
                  mid_cls_token=False,
                  bidirectional=False):
         super().__init__()
@@ -294,12 +307,18 @@ class VisionMamba(nn.Module):
         self.pos_embed = nn.Parameter(torch.zeros(1, num_patches + 1, embed_dim))
         self.pos_drop = nn.Dropout(p=drop_rate)
 
-        self.blocks = nn.ModuleList([
-            VimBlock(dim=embed_dim, d_state=d_state, d_conv=d_conv, expand=expand, bidirectional=bidirectional)
+        # Stochastic depth decay (matches official Vim)
+        dpr = [x.item() for x in torch.linspace(0, drop_path_rate, depth)]
+
+        # Use 'layers' to match official Vim checkpoint key naming
+        self.layers = nn.ModuleList([
+            VimBlock(dim=embed_dim, d_state=d_state, d_conv=d_conv, expand=expand,
+                     bidirectional=bidirectional, drop_path=dpr[i])
             for i in range(depth)
         ])
 
-        self.norm = nn.LayerNorm(embed_dim, eps=1e-6, bias=False)
+        # Use 'norm_f' to match official Vim checkpoint key naming
+        self.norm_f = RMSNorm(embed_dim, eps=1e-5)
         self.head = nn.Linear(embed_dim, num_classes)
 
         nn.init.trunc_normal_(self.pos_embed, std=.02)
@@ -311,8 +330,8 @@ class VisionMamba(nn.Module):
             nn.init.trunc_normal_(m.weight, std=.02)
             if isinstance(m, nn.Linear) and m.bias is not None:
                 nn.init.constant_(m.bias, 0)
-        elif isinstance(m, nn.LayerNorm):
-            if m.bias is not None:
+        elif isinstance(m, (nn.LayerNorm, RMSNorm)):
+            if hasattr(m, 'bias') and m.bias is not None:
                 nn.init.constant_(m.bias, 0)
             if m.weight is not None:
                 nn.init.constant_(m.weight, 1.0)
@@ -335,10 +354,10 @@ class VisionMamba(nn.Module):
         x = x + self.pos_embed
         x = self.pos_drop(x)
 
-        for block in self.blocks:
-            x = block(x)
+        for layer in self.layers:
+            x = layer(x)
 
-        x = self.norm(x)
+        x = self.norm_f(x)
         return x
 
     def forward(self, x):
@@ -598,27 +617,25 @@ def load_pretrained_weights(model, model_name="vim_small_midclstok"):
 
     state_dict = checkpoint["model"] if "model" in checkpoint else checkpoint
 
-    # Remap keys
-    new_state_dict = {}
-    for k, v in state_dict.items():
-        if k.startswith("layers."):
-            new_k = k.replace("layers.", "blocks.")
-        elif k.startswith("norm_f."):
-            new_k = k.replace("norm_f.", "norm.")
-        else:
-            new_k = k
-        new_state_dict[new_k] = v
+    # No key remapping needed — model attribute names now match official checkpoint:
+    #   self.layers (not blocks), self.norm_f (not norm)
 
     # Filter out head if num_classes doesn't match
-    if model.head.weight.shape[0] != new_state_dict.get("head.weight", torch.empty(0)).shape[0]:
+    if model.head.weight.shape[0] != state_dict.get("head.weight", torch.empty(0)).shape[0]:
         print(
-            f"Head mismatch (Pretrained: {new_state_dict.get('head.weight', torch.tensor([])).shape}, Current: {model.head.weight.shape}). Dropping head weights.")
-        if "head.weight" in new_state_dict: del new_state_dict["head.weight"]
-        if "head.bias" in new_state_dict: del new_state_dict["head.bias"]
+            f"Head mismatch (Pretrained: {state_dict.get('head.weight', torch.tensor([])).shape}, "
+            f"Current: {model.head.weight.shape}). Dropping head weights.")
+        state_dict = {k: v for k, v in state_dict.items() if not k.startswith("head.")}
 
-    # Load with strict=False to allow for missing head, but check for crucial mismatches
-    msg = model.load_state_dict(new_state_dict, strict=False)
-    print(f"Loaded weights with msg: {msg}")
+    # Load with strict=False
+    msg = model.load_state_dict(state_dict, strict=False)
+    print(f"Loaded pretrained weights:")
+    if msg.missing_keys:
+        print(f"  Missing keys: {msg.missing_keys}")
+    if msg.unexpected_keys:
+        print(f"  Unexpected keys: {msg.unexpected_keys}")
+    matched = len(state_dict) - len(msg.unexpected_keys)
+    print(f"  Matched: {matched}/{len(state_dict)} checkpoint keys")
     return model
 
 
@@ -907,8 +924,8 @@ def train_one_run(dataset_name: str, batch_size: int, peft_method: str, args, de
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--datasets", type=str, nargs='+', default=["cifar100"], help="List of datasets")
-    parser.add_argument("--batch_sizes", type=int, nargs='+', default=[16], help="List of batch sizes")
+    parser.add_argument("--datasets", type=str, nargs='+', default=["cifar100", "dtd"], help="List of datasets")
+    parser.add_argument("--batch_sizes", type=int, nargs='+', default=[32], help="List of batch sizes")
 
     parser.add_argument("--data_root", type=str, default=str(DEFAULT_DATA_ROOT))
     parser.add_argument("--outdir", type=str, default=str(DEFAULT_OUTDIR))
