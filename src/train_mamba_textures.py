@@ -8,6 +8,7 @@ from pathlib import Path
 from typing import List, Dict, Tuple, Optional
 from datetime import datetime
 import copy
+import traceback
 
 import torch
 import torch.nn as nn
@@ -49,12 +50,12 @@ STEPS_PER_EPOCH = 782
 NUM_WORKERS = 4
 SEED = 42
 MEMORY_CAPACITY_GB = 2.0
-DEFAULT_OUTDIR = Path('./mamba_pure_results/tmp')
+DEFAULT_OUTDIR = Path('./mamba_pure_results')
 DEFAULT_DATA_ROOT = Path('./data')
 
-# Set env for better memory handling
-os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "max_split_size_mb:128,garbage_collection_threshold:0.8"
 
+# Set env for better memory handling
+# os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "max_split_size_mb:128,garbage_collection_threshold:0.8"
 
 def iso_now():
     return datetime.now().isoformat(timespec="seconds")
@@ -682,11 +683,11 @@ def train_one_run(dataset_name: str, batch_size: int, peft_method: str, args, de
 
     # 3. PEFT & LR
     if peft_method == "none":
-        lr = 1e-4
-        print(f"[Mode: None] Using lower Learning Rate: {lr}")
+        lr = 2e-5
+        print(f"[Mode: FullFT] Learning Rate: {lr}")
     else:
-        lr = 1e-3
-        print(f"[Mode: {peft_method}] Using standard PEFT Learning Rate: {lr}")
+        lr = 5e-4
+        print(f"[Mode: {peft_method}] Learning Rate: {lr}")
 
     if peft_method == "qlora" and BNB_AVAILABLE:
         print(
@@ -758,13 +759,36 @@ def train_one_run(dataset_name: str, batch_size: int, peft_method: str, args, de
 
     model.to(device)
 
-    optimizer = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=0.05)
+    trainable_params = [p for p in model.parameters() if p.requires_grad]
+    optimizer = torch.optim.AdamW(trainable_params, lr=lr, weight_decay=0.05)
     criterion = nn.CrossEntropyLoss()
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=args.epochs)
 
     pwr = GpuPowerMeter(0, power_path)
 
     best_acc = 0.0
+    global_step = 0
+
+    # Baseline eval (epoch 0)
+    model.eval()
+    val_correct_base = 0
+    val_total_base = 0
+    with torch.no_grad():
+        for x, y in val_loader:
+            x, y = x.to(device), y.to(device)
+            out = model(x)
+            pred = out.argmax(dim=1)
+            val_correct_base += (pred == y).sum().item()
+            val_total_base += y.size(0)
+            if args.dry_run: break
+    base_acc = val_correct_base / val_total_base if val_total_base > 0 else 0
+    print(f"[BASELINE] Acc={base_acc*100:.2f}%")
+
+    with open(metrics_path, "a", newline="") as f:
+        w = csv.writer(f)
+        row = [0, "0.000", "0.000", "0.000", "0.000", "0.000", "0.000", "0.000", f"{base_acc*100:.2f}"]
+        for _ in ab_values: row.append("nan")
+        w.writerow(row)
 
     for epoch in range(args.epochs):
         pwr.reset_epoch()
@@ -779,13 +803,19 @@ def train_one_run(dataset_name: str, batch_size: int, peft_method: str, args, de
             p_start = pwr.sample_power_w()
             t0 = time.time()
 
-            x, y = x.to(device), y.to(device)
+            x, y = x.to(device, non_blocking=True), y.to(device, non_blocking=True)
 
-            optimizer.zero_grad()
+            optimizer.zero_grad(set_to_none=True)
             out = model(x)
             loss = criterion(out, y)
             loss.backward()
+
+            # AdaLoRA: update rank budget after backward, before step
+            if peft_method == "adalora" and hasattr(model, "base_model") and hasattr(model.base_model, "update_and_allocate"):
+                model.base_model.update_and_allocate(global_step)
+
             optimizer.step()
+            global_step += 1
 
             # Record stats
             torch.cuda.synchronize()
@@ -818,7 +848,7 @@ def train_one_run(dataset_name: str, batch_size: int, peft_method: str, args, de
                 p_start = pwr.sample_power_w()
                 t0 = time.time()
 
-                x, y = x.to(device), y.to(device)
+                x, y = x.to(device, non_blocking=True), y.to(device, non_blocking=True)
                 out = model(x)
                 pred = out.argmax(dim=1)
                 val_correct += (pred == y).sum().item()
@@ -854,8 +884,8 @@ def train_one_run(dataset_name: str, batch_size: int, peft_method: str, args, de
             ]
             for a in ab_values:
                 key = f"SAM_a{a}_b{a}"
-                val = sam_res.get(key, float("nan"))
-                row.append(f"{val:.4e}")
+                sam_val = sam_res.get(key, float("nan"))
+                row.append(f"{sam_val:.6f}" if not math.isnan(sam_val) else "nan")
             w.writerow(row)
 
         # Save Best & Last
@@ -912,7 +942,10 @@ def main():
                 try:
                     train_one_run(dataset, batch_size, peft_method, args, device, base_outdir)
                 except Exception as e:
-                    print(f"Error in run: {e}")
+                    print(f"\n[ERROR] Run failed: {e}")
+                    traceback.print_exc()
+                    print("[SKIP] Continuing to next configuration...\n")
+                torch.cuda.empty_cache()
 
 
 if __name__ == "__main__":
