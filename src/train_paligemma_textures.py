@@ -23,6 +23,7 @@ Login (required — gated model):
 """
 
 import os
+# NOTE: expandable_segments:True breaks on WSL2/CUDA 11.8 — causes "CUDA driver error"
 os.environ["PYTORCH_CUDA_ALLOC_CONF"] = (
     "max_split_size_mb:128,garbage_collection_threshold:0.8"
 )
@@ -36,7 +37,9 @@ import torch
 from torchvision import datasets, transforms
 from tqdm.auto import tqdm
 from PIL import Image
-from transformers import PaliGemmaForConditionalGeneration, AutoProcessor
+from transformers import (
+    PaliGemmaForConditionalGeneration, AutoProcessor, BitsAndBytesConfig,
+)
 import torchvision
 
 print(f"torch={torch.__version__}  torchvision={torchvision.__version__}  "
@@ -53,6 +56,26 @@ SEED            = 42
 MAX_NEW_TOKENS  = 16
 MAX_SAMPLES     = None        # set e.g. 500 for a quick test, None = full dataset
 LOAD_IN_8BIT    = False       # set True if OOM (requires bitsandbytes)
+FT_MODE         = os.environ.get("VLM_FT_MODE", "zero_shot")  # "zero_shot" | "projector_lora" | "qlora"
+FT_EPOCHS       = int(os.environ.get("VLM_FT_EPOCHS", "2"))
+# QLoRA wants a higher LoRA LR (~2e-4) than the fp32-projector mode (~2e-5).
+_default_ft_lr  = "2e-4" if FT_MODE == "qlora" else "2e-5"
+FT_LR           = float(os.environ.get("VLM_FT_LR", _default_ft_lr))
+FT_STEPS_PER_EPOCH = int(os.environ.get("VLM_FT_STEPS", "500"))
+FT_SKIP_BASELINE = os.environ.get("VLM_FT_SKIP_BASELINE", "0") == "1"
+# --- QLoRA (FT_MODE="qlora") knobs ---
+FT_GRAD_ACCUM      = int(os.environ.get("VLM_FT_GRAD_ACCUM", "8"))    # effective batch = bs(1) * accum
+FT_LORA_R          = int(os.environ.get("VLM_FT_LORA_R", "16"))
+FT_LORA_ALPHA      = int(os.environ.get("VLM_FT_LORA_ALPHA", "32"))
+FT_LORA_DROPOUT    = float(os.environ.get("VLM_FT_LORA_DROPOUT", "0.05"))
+FT_TRAIN_PROJECTOR = os.environ.get("VLM_FT_TRAIN_PROJECTOR", "0") == "1"  # fp16 projector FT can NaN
+# --- "light-touch" FT knobs: avoid catastrophic forgetting of the zero-shot prior ---
+# Train with the SAME prompt used at eval (default), and early-stop on a held-out
+# validation subset so we keep the BEST adapter instead of overfitting to loss=0.
+FT_PROMPT_MODE = os.environ.get("VLM_FT_PROMPT", "eval")   # "eval" (match eval) | "short"
+FT_VAL_EVERY   = int(os.environ.get("VLM_FT_VAL_EVERY", "25"))    # validate every N steps (0=off)
+FT_VAL_SAMPLES = int(os.environ.get("VLM_FT_VAL_SAMPLES", "120")) # held-out images for val
+FT_PATIENCE    = int(os.environ.get("VLM_FT_PATIENCE", "3"))      # stop after N vals w/o improvement
 # ==========================================================
 
 SCRIPT_DIR = Path(__file__).resolve().parent
@@ -118,8 +141,20 @@ DTD_CLASSES = [
 
 # Open-ended prompts — no class list to avoid exceeding PaliGemma's sequence limit.
 # match_class() handles fuzzy matching against class_names after generation.
-CIFAR100_PROMPT = "What is in this image? Answer with a single word or short phrase."
-DTD_PROMPT = "What texture or pattern is shown? Answer with a single word."
+CIFAR100_PROMPT = (
+    "Classify this image into exactly one of these categories: {}. "
+    "Answer with ONLY the category name, nothing else."
+)
+DTD_PROMPT = (
+    "What texture or pattern does this image show? Choose exactly one from: {}. "
+    "Answer with ONLY the texture name, nothing else."
+)
+
+# Short prompts for FT — class list is too long (100 classes ≈ 320 tokens) and
+# pushes fp32 logits over 8GB VRAM during backward. The model just needs to learn
+# image → class name; the verbose instruction is only useful at eval time for matching.
+CIFAR100_FT_PROMPT = "What is in this image?"
+DTD_FT_PROMPT = "What texture is shown?"
 
 DTD_DEFINITIONS = {
     "banded":       "parallel stripes of alternating colors",
@@ -389,23 +424,71 @@ def ensure_metrics_csv_header(ab_values, path):
 
 
 # ========================= MODEL =========================
-def build_paligemma(model_id):
+def build_paligemma(model_id, quantize_4bit=False):
     print(f"[PaliGemma] Loading {model_id}...")
     processor = AutoProcessor.from_pretrained(model_id)
 
-    load_kwargs = dict(
-        torch_dtype=torch.float16,
-        device_map=None,
-        low_cpu_mem_usage=True,
-    )
-    if LOAD_IN_8BIT:
-        load_kwargs["load_in_8bit"] = True
-        load_kwargs.pop("torch_dtype")  # incompatible with 8-bit
-        print("[PaliGemma] Loading in 8-bit (bitsandbytes)...")
+    if quantize_4bit:
+        # --- Version-skew workaround (transformers 4.44 + accelerate 1.12) ---
+        # transformers 4.44 still routes bnb models through accelerate.dispatch_model,
+        # whose 1.12 build calls model.to(device) — forbidden for 4-bit models (they're
+        # already placed on GPU during load). Newer transformers skip dispatch for
+        # quantized models; we replicate that by no-op'ing dispatch for them.
+        import transformers.modeling_utils as _mu
+        if not getattr(_mu, "_bnb_dispatch_patched", False):
+            _orig_dispatch = _mu.dispatch_model
+            def _safe_dispatch(model, *a, **k):
+                if (getattr(model, "is_loaded_in_4bit", False)
+                        or getattr(model, "is_loaded_in_8bit", False)
+                        or getattr(model, "is_quantized", False)):
+                    return model  # already on the correct device, nothing to dispatch
+                return _orig_dispatch(model, *a, **k)
+            _mu.dispatch_model = _safe_dispatch
+            _mu._bnb_dispatch_patched = True
 
-    model = PaliGemmaForConditionalGeneration.from_pretrained(
-        model_id, **load_kwargs
-    ).to(device)
+        # NF4 4-bit base for QLoRA: ~2 GB instead of ~6 GB fp16, freeing room on
+        # 8 GB for LoRA adapters + optimizer state + backward activations.
+        bnb_config = BitsAndBytesConfig(
+            load_in_4bit=True,
+            bnb_4bit_quant_type="nf4",
+            bnb_4bit_compute_dtype=torch.float16,
+            bnb_4bit_use_double_quant=True,
+        )
+        print("[PaliGemma] Loading in 4-bit NF4 (QLoRA)...")
+        # quantized weights are placed by device_map — do NOT .to(device) afterwards.
+        model = PaliGemmaForConditionalGeneration.from_pretrained(
+            model_id,
+            quantization_config=bnb_config,
+            device_map={"": 0},
+            torch_dtype=torch.float16,
+            low_cpu_mem_usage=True,
+        )
+        # Skipping dispatch (above) means non-persistent buffers such as SigLIP's
+        # `position_ids` were left on CPU while all weights are on GPU. Relocate them.
+        _gpu = torch.device("cuda:0")
+        for _, _mod in model.named_modules():
+            for _bn, _buf in list(_mod._buffers.items()):
+                if _buf is not None and _buf.device != _gpu:
+                    _mod._buffers[_bn] = _buf.to(_gpu)
+    else:
+        load_kwargs = dict(
+            torch_dtype=torch.float16,
+            device_map=None,
+            low_cpu_mem_usage=True,
+        )
+        if LOAD_IN_8BIT:
+            load_kwargs["load_in_8bit"] = True
+            load_kwargs.pop("torch_dtype")  # incompatible with 8-bit
+            print("[PaliGemma] Loading in 8-bit (bitsandbytes)...")
+
+        model = PaliGemmaForConditionalGeneration.from_pretrained(
+            model_id, **load_kwargs
+        ).to(device)
+    # Disable KV-cache: it keeps the autograd graph alive across forward passes
+    # and inflates backward memory (root cause of "CUDA unknown error" on 8GB).
+    model.config.use_cache = False
+    if hasattr(model, "language_model"):
+        model.language_model.config.use_cache = False
     model.eval()
 
     total_params = sum(p.numel() for p in model.parameters()) / 1e6
@@ -415,6 +498,202 @@ def build_paligemma(model_id):
         print(f"[PaliGemma] VRAM after load: {used:.2f} GB")
 
     return model, processor
+
+
+# ========================= LoRA HELPERS =========================
+class LoRALinear(torch.nn.Module):
+    """Drop-in LoRA wrapper for nn.Linear. Keeps original weight frozen.
+    Trainable params (lora_A, lora_B) live in fp32 for stable backward,
+    while the frozen base linear stays in the model's original dtype (fp16)."""
+    def __init__(self, linear: torch.nn.Linear, r: int = 4, alpha: int = 8, dropout: float = 0.05):
+        super().__init__()
+        self.linear = linear
+        self.linear.weight.requires_grad = False
+        if linear.bias is not None:
+            self.linear.bias.requires_grad = False
+        self.scaling = alpha / r
+        in_f, out_f = linear.in_features, linear.out_features
+        dev = linear.weight.device
+        self.lora_A = torch.nn.Linear(in_f, r, bias=False).to(dtype=torch.float32, device=dev)
+        self.lora_B = torch.nn.Linear(r, out_f, bias=False).to(dtype=torch.float32, device=dev)
+        self.drop   = torch.nn.Dropout(p=dropout)
+        torch.nn.init.kaiming_uniform_(self.lora_A.weight, a=math.sqrt(5))
+        torch.nn.init.zeros_(self.lora_B.weight)
+
+    def forward(self, x):
+        base = self.linear(x)
+        lora = self.lora_B(self.lora_A(self.drop(x.to(torch.float32)))) * self.scaling
+        return base + lora.to(base.dtype)
+
+
+def setup_projector_lora_paligemma(model, n_lm_layers: int = 4, lora_r: int = 4):
+    """Projector full FT + LoRA r=lora_r on first n_lm_layers of Gemma LM. All else frozen."""
+    for p in model.parameters():
+        p.requires_grad = False
+
+    lm_layers = model.language_model.model.layers
+    for i in range(min(n_lm_layers, len(lm_layers))):
+        attn = lm_layers[i].self_attn
+        for proj_name in ("q_proj", "v_proj"):
+            setattr(attn, proj_name,
+                    LoRALinear(getattr(attn, proj_name), r=lora_r, alpha=lora_r * 2))
+
+    # Cast multi_modal_projector to fp32 — training a fp16 projector via AdamW
+    # produces NaN gradients. Eval still works because model.generate() is wrapped
+    # in autocast(fp16) which harmonizes dtypes between fp32 projector and fp16 LM.
+    for name, p in model.named_parameters():
+        if "multi_modal_projector" in name:
+            p.data = p.data.to(torch.float32)
+            p.requires_grad = True
+
+    # Gradient checkpointing — re-compute activations during backward to cut peak VRAM.
+    # use_reentrant=True is more stable on transformers 4.41 / torch 2.4 than the
+    # newer non-reentrant variant which has known NaN issues with PaLiGemma forward.
+    if hasattr(model, "gradient_checkpointing_enable"):
+        try:
+            model.gradient_checkpointing_enable(gradient_checkpointing_kwargs={"use_reentrant": True})
+        except TypeError:
+            model.gradient_checkpointing_enable()
+        if hasattr(model, "enable_input_require_grads"):
+            model.enable_input_require_grads()
+        print("[projector_lora] Gradient checkpointing enabled (use_reentrant=True)")
+
+    trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
+    total     = sum(p.numel() for p in model.parameters())
+    print(f"[projector_lora] Trainable: {trainable/1e6:.3f}M / {total/1e6:.1f}M "
+          f"({100*trainable/total:.2f}%)")
+    return model
+
+
+def setup_qlora_paligemma(model, r=16, alpha=32, dropout=0.05, train_projector=False):
+    """QLoRA: 4-bit frozen base (loaded via build_paligemma(quantize_4bit=True)) +
+    LoRA adapters on the Gemma language model (attention q/k/v/o + MLP gate/up/down,
+    all layers). Uses the `peft` library, which integrates with bitsandbytes Linear4bit.
+
+    Compared to setup_projector_lora_paligemma (r=4, q/v on 4 layers, fp32 projector),
+    this adapts far more of the model so fine-tuning can actually move accuracy — the
+    4-bit base buys back the VRAM that the extra adapters cost.
+    """
+    from peft import LoraConfig, get_peft_model, prepare_model_for_kbit_training
+
+    # Casts layernorms to fp32, enables input grads, turns off use_cache, and wires
+    # gradient checkpointing — all required for stable 4-bit backward.
+    model = prepare_model_for_kbit_training(model, use_gradient_checkpointing=True)
+
+    # Regex restricted to the Gemma LM so we DON'T also adapt the SigLIP vision tower
+    # (whose attention also exposes q_proj/k_proj/v_proj). peft re.fullmatch's this.
+    target = (r"language_model\..*\."
+              r"(q_proj|k_proj|v_proj|o_proj|gate_proj|up_proj|down_proj)")
+    # Training the (non-quantized, fp16) projector via AdamW is prone to NaN — off by
+    # default; enable with VLM_FT_TRAIN_PROJECTOR=1 if you want to risk it.
+    modules_to_save = ["multi_modal_projector"] if train_projector else None
+
+    lora_cfg = LoraConfig(
+        r=r, lora_alpha=alpha, lora_dropout=dropout, bias="none",
+        task_type="CAUSAL_LM",
+        target_modules=target,
+        modules_to_save=modules_to_save,
+    )
+    model = get_peft_model(model, lora_cfg)
+    if hasattr(model, "enable_input_require_grads"):
+        model.enable_input_require_grads()
+
+    _register_logits_keep_hook(model)
+
+    print(f"[qlora] r={r} alpha={alpha} dropout={dropout} "
+          f"train_projector={train_projector}")
+    model.print_trainable_parameters()
+    return model
+
+
+# When set to an int K, the lm_head pre-hook (see _register_logits_keep_hook) computes
+# logits for only the LAST K sequence positions. This caps the full-vocab fp32 logits
+# tensor — for CIFAR's 495-token prompt the full (1,495,256000) fp32 tensor is ~0.5 GB,
+# a large contiguous alloc that intermittently fails as "CUDA unknown error" on 8 GB
+# WSL2. We only supervise the last few (answer) tokens, so the rest are never needed.
+_LOGITS_KEEP = None
+
+
+def _register_logits_keep_hook(model):
+    """Cap lm_head to the last `_LOGITS_KEEP` positions during training. None = full
+    (used at eval/generation, which needs logits for the running last token only)."""
+    lm_head = model.get_output_embeddings()
+    if lm_head is None:
+        for name, mod in model.named_modules():
+            if name.endswith("lm_head") and isinstance(mod, torch.nn.Linear):
+                lm_head = mod
+                break
+    if lm_head is None:
+        print("[qlora] WARN: lm_head not found — logits-keep memory cap disabled.")
+        return
+
+    def _pre_hook(module, args):
+        k = _LOGITS_KEEP
+        if k is None or not args:
+            return None
+        hs = args[0]
+        if torch.is_tensor(hs) and hs.dim() == 3 and hs.shape[1] > k:
+            return (hs[:, -k:, :],) + tuple(args[1:])
+        return None
+
+    lm_head.register_forward_pre_hook(_pre_hook)
+    print("[qlora] lm_head logits-keep hook registered (caps fp32 logits memory).")
+
+
+def train_step_sft_paligemma(model, processor, image, class_name, prompt_str, _debug=False):
+    """SFT step: compute cross-entropy loss on class-name tokens.
+
+    Computes loss manually from logits because older transformers versions
+    (4.41-4.42) do not compute loss inside PaliGemmaForConditionalGeneration.
+    """
+    global _LOGITS_KEEP
+    full_text = f"{prompt_str} {class_name}"
+    inputs = processor(images=image, text=full_text, return_tensors="pt").to(device)
+    # Cast pixel_values to fp16 to match the frozen vision_tower's weights.
+    # Don't use next(model.parameters()).dtype — it now returns fp32 (projector).
+    if "pixel_values" in inputs:
+        inputs["pixel_values"] = inputs["pixel_values"].to(dtype=torch.float16)
+
+    if _debug:
+        for k, v in inputs.items():
+            if torch.is_tensor(v):
+                nan_str = (f"has_nan={v.isnan().any().item()}" if v.is_floating_point()
+                           else "is_int")
+                print(f"[DEBUG] input[{k}] shape={tuple(v.shape)} dtype={v.dtype} {nan_str}")
+
+    # We supervise the last n_unmask tokens (class name + trailing EOS). Tell the
+    # lm_head pre-hook to only compute logits for the last (n_unmask+1) positions —
+    # everything earlier is irrelevant to the loss and just wastes ~0.5 GB of VRAM.
+    answer_ids = processor.tokenizer(class_name, add_special_tokens=False,
+                                      return_tensors="pt").input_ids
+    n_answer = max(answer_ids.shape[1], 1)
+    seq = inputs["input_ids"].shape[1]
+    n_unmask = min(n_answer + 1, seq)
+    keep = min(n_unmask + 1, seq)
+
+    _LOGITS_KEEP = keep
+    try:
+        outputs = model(**inputs)
+        logits = outputs.logits  # (1, L, vocab); L == keep when the hook fires, else seq
+    finally:
+        _LOGITS_KEEP = None
+
+    if _debug:
+        print(f"[DEBUG] logits dtype={logits.dtype} shape={tuple(logits.shape)} "
+              f"has_nan={logits.isnan().any().item()} has_inf={logits.isinf().any().item()} "
+              f"min={logits.min().item():.3f} max={logits.max().item():.3f}")
+
+    # Causal-LM shift: the logit at sequence position p predicts token p+1. logits
+    # covers the last L positions [seq-L, seq-1], so sliced index i ↔ global (seq-L+i).
+    # The n_unmask supervised tokens sit at global [seq-n_unmask, seq-1] and are
+    # predicted by logit indices [L-n_unmask-1, L-2]. (When L==seq this reduces to the
+    # usual full-sequence shift.)
+    L = logits.shape[1]
+    relevant_logits = logits[0, L - n_unmask - 1: L - 1, :]      # (n_unmask, vocab)
+    relevant_labels = inputs["input_ids"][0, seq - n_unmask: seq]
+    if relevant_logits.dtype != torch.float32:
+        relevant_logits = relevant_logits.float()
+    return torch.nn.functional.cross_entropy(relevant_logits, relevant_labels)
 
 
 def match_class(generated_text, class_names):
@@ -452,11 +731,14 @@ def generate_for_image(model, processor, image, prompt_str):
 
     input_len = inputs["input_ids"].shape[1]
 
-    output_ids = model.generate(
-        **inputs,
-        do_sample=False,
-        max_new_tokens=MAX_NEW_TOKENS,
-    )
+    # autocast(fp16) harmonizes dtypes — needed when trainable params (projector,
+    # LoRA A/B) are fp32 but the rest of the model is fp16.
+    with torch.autocast(device_type="cuda", dtype=torch.float16):
+        output_ids = model.generate(
+            **inputs,
+            do_sample=False,
+            max_new_tokens=MAX_NEW_TOKENS,
+        )
 
     generated = processor.decode(
         output_ids[0, input_len:], skip_special_tokens=True
@@ -472,7 +754,13 @@ def run_eval_generative(model, processor, test_ds, class_names,
     correct = total = no_match = 0
     start_t = time.time()
 
-    prompt_str = prompt_tpl  # open-ended, no class list
+    # Format prompt with the class list (the {} placeholder in CIFAR100_PROMPT / DTD_PROMPT).
+    # Without the explicit list, the model answers free-form and match_class fails 100%.
+    if "{}" in prompt_tpl:
+        class_list_str = ", ".join(cn.replace("_", " ") for cn in class_names)
+        prompt_str = prompt_tpl.format(class_list_str)
+    else:
+        prompt_str = prompt_tpl
 
     n_samples = len(test_ds) if MAX_SAMPLES is None else min(MAX_SAMPLES, len(test_ds))
 
@@ -571,6 +859,29 @@ def run_eval_hierarchical(model, processor, test_ds, class_names, pwr, epoch_idx
     return acc, elapsed
 
 
+@torch.no_grad()
+def quick_val_acc(model, processor, val_ds, val_indices, class_names, prompt_str):
+    """Greedy-generation accuracy on a small held-out subset — the early-stopping
+    signal. Uses the SAME prompt as final eval so train/val/eval are consistent."""
+    was_training = model.training
+    model.eval()
+    correct = 0
+    for i in val_indices:
+        img, label = val_ds[i]
+        if isinstance(img, torch.Tensor):
+            img = transforms.ToPILImage()(img)
+        elif not isinstance(img, Image.Image):
+            img = Image.fromarray(np.array(img))
+        if img.mode != "RGB":
+            img = img.convert("RGB")
+        gen = generate_for_image(model, processor, img, prompt_str)
+        if match_class(gen, class_names) == label:
+            correct += 1
+    if was_training:
+        model.train()
+    return 100.0 * correct / max(len(val_indices), 1)
+
+
 # ========================= MAIN =========================
 def run_experiment(dataset_name):
     model_tag = MODEL_ID.split("/")[-1]
@@ -591,35 +902,252 @@ def run_experiment(dataset_name):
     print(f"[{dataset_name.upper()}] {len(class_names)} classes | "
           f"{n_samples} test images (of {len(test_ds)})")
 
-    # Load model fresh each dataset to avoid VRAM fragmentation
-    model, processor = build_paligemma(MODEL_ID)
+    # Load model fresh each dataset to avoid VRAM fragmentation.
+    # QLoRA needs the 4-bit base; baseline eval (if run) then uses the 4-bit model too.
+    model, processor = build_paligemma(MODEL_ID, quantize_4bit=(FT_MODE == "qlora"))
     pwr = GpuPowerMeter(device_index=GPU_INDEX, step_energy_path=step_energy_gz)
 
     try:
-        use_hier = USE_HIERARCHICAL and dataset_name == "cifar100"
-        mode_tag = "HIERARCHICAL" if use_hier else "ZERO-SHOT"
-        print(f">>> {mode_tag} evaluation...")
-        pwr.reset_epoch()
-        if use_hier:
-            acc, eval_time = run_eval_hierarchical(
-                model, processor, test_ds, class_names, pwr, epoch_idx=0)
+        if not FT_SKIP_BASELINE:
+            use_hier = USE_HIERARCHICAL and dataset_name == "cifar100"
+            mode_tag = "HIERARCHICAL" if use_hier else "ZERO-SHOT"
+            print(f">>> {mode_tag} evaluation...")
+            pwr.reset_epoch()
+            if use_hier:
+                acc, eval_time = run_eval_hierarchical(
+                    model, processor, test_ds, class_names, pwr, epoch_idx=0)
+            else:
+                acc, eval_time = run_eval_generative(
+                    model, processor, test_ds, class_names, prompt_tpl, pwr, epoch_idx=0)
+
+            totals = pwr.epoch_totals()
+            print(f"\n[{mode_tag}] Acc={acc:.2f}% | Time={eval_time:.1f}s | "
+                  f"AvgW={totals['avg_power_w']:.1f} | Energy={totals['total_energy_j']:.0f}J")
+
+            sam_vals = compute_sam(acc, totals["total_energy_j"], ab_vals)
+            row = [0, 0.0, f"{eval_time:.3f}", f"{eval_time:.3f}",
+                   0.0, f"{totals['eval_energy_j']:.3f}", f"{totals['total_energy_j']:.3f}",
+                   f"{totals['avg_power_w']:.3f}", f"{acc:.2f}"]
+            for a in ab_vals:
+                v = sam_vals[f"SAM_a{a}_b{a}"]
+                row.append(f"{v:.6f}" if not math.isnan(v) else "nan")
+            with open(metrics_csv, "a", newline="") as f:
+                csv.writer(f).writerow(row)
         else:
+            print(f"[SKIP BASELINE] Skipping zero-shot eval — using existing results.")
+
+        # --- SFT fine-tuning (projector_lora / qlora modes) ---
+        if FT_MODE in ("projector_lora", "qlora") and FT_EPOCHS > 0:
+            if FT_MODE == "qlora":
+                model = setup_qlora_paligemma(
+                    model, r=FT_LORA_R, alpha=FT_LORA_ALPHA,
+                    dropout=FT_LORA_DROPOUT, train_projector=FT_TRAIN_PROJECTOR)
+            else:
+                model = setup_projector_lora_paligemma(model, n_lm_layers=4, lora_r=4)
+            trainable_params = [p for p in model.parameters() if p.requires_grad]
+            optimizer = torch.optim.AdamW(trainable_params, lr=FT_LR, weight_decay=0.01)
+
+            if dataset_name == "cifar100":
+                train_ds_ft = datasets.CIFAR100(root=str(DATA_ROOT), train=True,
+                                                transform=None, download=True)
+            else:
+                train_ds_ft = datasets.DTD(root=str(DATA_ROOT), split="train",
+                                           transform=None, download=True)
+
+            # Build the eval prompt (long, with class list) once. When FT_PROMPT_MODE
+            # =="eval" we train + validate with this SAME prompt, so the model is
+            # fine-tuned in exactly the format it's scored in (fixes train/eval mismatch).
+            if "{}" in prompt_tpl:
+                _class_list = ", ".join(cn.replace("_", " ") for cn in class_names)
+                eval_prompt_str = prompt_tpl.format(_class_list)
+            else:
+                eval_prompt_str = prompt_tpl
+            if FT_PROMPT_MODE == "eval":
+                ft_prompt = eval_prompt_str
+            else:
+                ft_prompt = CIFAR100_FT_PROMPT if dataset_name == "cifar100" else DTD_FT_PROMPT
+
+            # Carve a disjoint validation subset for early stopping (qlora/peft only).
+            use_earlystop = FT_VAL_EVERY > 0 and FT_MODE == "qlora"
+            val_ds = val_indices = None
+            train_pool = list(range(len(train_ds_ft)))
+            if use_earlystop:
+                if dataset_name == "dtd":
+                    val_ds = datasets.DTD(root=str(DATA_ROOT), split="val",
+                                          transform=None, download=True)
+                    _vp = list(range(len(val_ds))); random.shuffle(_vp)
+                    val_indices = _vp[:FT_VAL_SAMPLES]
+                else:
+                    # CIFAR has no val split — hold out a disjoint slice of train.
+                    random.shuffle(train_pool)
+                    val_ds = train_ds_ft
+                    val_indices = train_pool[:FT_VAL_SAMPLES]
+                    train_pool = train_pool[FT_VAL_SAMPLES:]
+                print(f"[FT] Early stopping ON: {len(val_indices)} val imgs every "
+                      f"{FT_VAL_EVERY} steps, patience={FT_PATIENCE}")
+
+            print(f"\n[FT] {FT_MODE} | Epochs={FT_EPOCHS} Steps={FT_STEPS_PER_EPOCH} "
+                  f"GradAccum={FT_GRAD_ACCUM} LR={FT_LR:.1e} prompt={FT_PROMPT_MODE}")
+            print(f"[FT] Trainable: {sum(p.numel() for p in trainable_params)/1e6:.3f}M params")
+
+            torch.cuda.empty_cache()
+
+            # Early-stopping bookkeeping. Best adapter kept on CPU (~80 MB) and restored
+            # before final eval, so we report the BEST checkpoint, not the overfit one.
+            try:
+                from peft import get_peft_model_state_dict, set_peft_model_state_dict
+            except Exception:
+                get_peft_model_state_dict = set_peft_model_state_dict = None
+            best_val_acc = -1.0
+            best_state = None
+            vals_no_improve = 0
+            global_step = 0
+            stop_training = False
+
+            total_train_time = 0.0
+            total_train_energy = 0.0
+
+            for epoch in range(1, FT_EPOCHS + 1):
+                model.train()
+                pwr.reset_epoch()
+                torch.cuda.reset_peak_memory_stats(device)
+                start_epoch_t = time.time()
+                total_loss = 0.0
+                optimizer.zero_grad(set_to_none=True)  # fresh accumulator each epoch
+
+                indices = random.sample(train_pool,
+                                        min(FT_STEPS_PER_EPOCH, len(train_pool)))
+                n_steps = len(indices)
+
+                for step, idx in enumerate(tqdm(indices, desc=f"FT Epoch {epoch}", leave=False), 1):
+                    img, label = train_ds_ft[idx]
+                    if isinstance(img, torch.Tensor):
+                        img = transforms.ToPILImage()(img)
+                    elif not isinstance(img, Image.Image):
+                        img = Image.fromarray(np.array(img))
+                    if img.mode != "RGB":
+                        img = img.convert("RGB")
+
+                    class_name = class_names[label]
+                    if step == 1 or step % 10 == 0:
+                        torch.cuda.empty_cache()
+                    _maybe_sync()
+                    p_start = pwr.sample_power_w()
+                    t0 = time.time()
+
+                    _is_first = (epoch == 1 and step == 1)
+                    # autocast(fp16) needed: trainable LoRA + projector are fp32 but
+                    # base model is fp16 — autocast harmonizes the dtype mismatch in
+                    # matmuls. pixel_values cast to fp16 explicitly inside train_step.
+                    with torch.autocast(device_type="cuda", dtype=torch.float16):
+                        loss = train_step_sft_paligemma(
+                            model, processor, img, class_name, ft_prompt, _debug=_is_first)
+                    if _is_first:
+                        print(f"[DEBUG] step1 loss={loss.item()}")
+                    if not torch.isfinite(loss):
+                        # Drop whatever grads accumulated so far this window — a NaN/Inf
+                        # loss would corrupt trainable params on the next optimizer.step().
+                        optimizer.zero_grad(set_to_none=True)
+                        if step % 10 == 0 or step == 1:
+                            print(f"[FT E{epoch} S{step:03d}] SKIP — loss={loss.item()}")
+                        continue
+                    # Gradient accumulation: scale so the summed grads ≈ mean over the window.
+                    (loss / FT_GRAD_ACCUM).backward()
+                    if step % FT_GRAD_ACCUM == 0 or step == n_steps:
+                        torch.nn.utils.clip_grad_norm_(trainable_params, max_norm=1.0)
+                        optimizer.step()
+                        optimizer.zero_grad(set_to_none=True)
+
+                    step_t = time.time() - t0
+                    _maybe_sync()
+                    pwr.log_step("train", epoch, step, step_t, p_start, pwr.sample_power_w())
+                    total_loss += loss.item()
+
+                    if step % 10 == 0:
+                        peak = torch.cuda.max_memory_allocated(device) / 1024**3
+                        print(f"[FT E{epoch} S{step:03d}] loss={loss.item():.4f} "
+                              f"avg={total_loss/step:.4f} peak={peak:.2f}GB")
+
+                    # --- periodic validation + early stopping ---
+                    global_step += 1
+                    if use_earlystop and global_step % FT_VAL_EVERY == 0:
+                        # Free training cache before validation generation — on 8 GB
+                        # WSL2 the train+generate memory mix fragments VRAM and surfaces
+                        # as "CUDA unknown error" on the next backward (esp. CIFAR's
+                        # longer ~495-token prompt). Defragment before and after.
+                        torch.cuda.empty_cache()
+                        v_acc = quick_val_acc(model, processor, val_ds, val_indices,
+                                              class_names, eval_prompt_str)
+                        improved = v_acc > best_val_acc + 1e-6
+                        if improved:
+                            best_val_acc = v_acc
+                            vals_no_improve = 0
+                            if get_peft_model_state_dict is not None:
+                                # Keep the best adapter on CPU — avoids a second ~78 MB
+                                # copy living on the GPU and the fragmentation it causes.
+                                best_state = {k: v.detach().to("cpu", copy=True)
+                                              for k, v in get_peft_model_state_dict(model).items()}
+                            tag = "↑ best"
+                        else:
+                            vals_no_improve += 1
+                            tag = f"no-improve {vals_no_improve}/{FT_PATIENCE}"
+                        print(f"[FT VAL @step {global_step}] val_acc={v_acc:.2f}%  "
+                              f"(best={best_val_acc:.2f}%, {tag})")
+                        torch.cuda.empty_cache()
+                        if vals_no_improve >= FT_PATIENCE:
+                            print(f"[FT] Early stop — no val improvement for {FT_PATIENCE} "
+                                  f"checks. Best val_acc={best_val_acc:.2f}%")
+                            stop_training = True
+                            break
+
+                dt_train = time.time() - start_epoch_t
+                ep_totals = pwr.epoch_totals()
+                total_train_time   += dt_train
+                total_train_energy += ep_totals["train_energy_j"]
+
+                print(f"[FT Epoch {epoch}/{FT_EPOCHS}] avg_loss={total_loss/max(step,1):.4f} "
+                      f"TrainT={dt_train/60:.1f}min "
+                      f"TrainEnergy={ep_totals['train_energy_j']:.0f}J")
+
+                if stop_training:
+                    break
+
+            # ---- Restore best adapter (early stopping) before final eval ----
+            if use_earlystop and best_state is not None and set_peft_model_state_dict is not None:
+                set_peft_model_state_dict(model, best_state)  # loads CPU tensors into GPU params
+                torch.cuda.empty_cache()
+                print(f"[FT] Restored best adapter (val_acc={best_val_acc:.2f}%) for final eval.")
+            elif use_earlystop:
+                print(f"[FT] No improving checkpoint captured — using last weights.")
+
+            # ---- Final eval (once, after all epochs) ----
+            # Use the LONG prompt with class list for eval (helps match_class).
+            # Eval is no-grad so memory is much lower — long prompt fits fine.
+            print(f"\n[FT] All {FT_EPOCHS} epochs done — running final eval...")
+            pwr.reset_epoch()
             acc, eval_time = run_eval_generative(
-                model, processor, test_ds, class_names, prompt_tpl, pwr, epoch_idx=0)
+                model, processor, test_ds, class_names, prompt_tpl, pwr,
+                epoch_idx=FT_EPOCHS)
 
-        totals = pwr.epoch_totals()
-        print(f"\n[{mode_tag}] Acc={acc:.2f}% | Time={eval_time:.1f}s | "
-              f"AvgW={totals['avg_power_w']:.1f} | Energy={totals['total_energy_j']:.0f}J")
+            eval_totals = pwr.epoch_totals()
+            total_energy = total_train_energy + eval_totals["eval_energy_j"]
+            avg_power = (total_energy / (total_train_time + eval_time)
+                         if (total_train_time + eval_time) > 0 else float("nan"))
+            sam_vals = compute_sam(acc, total_energy, ab_vals)
+            row = [FT_EPOCHS, f"{total_train_time:.3f}", f"{eval_time:.3f}",
+                   f"{total_train_time + eval_time:.3f}",
+                   f"{total_train_energy:.3f}", f"{eval_totals['eval_energy_j']:.3f}",
+                   f"{total_energy:.3f}", f"{avg_power:.3f}",
+                   f"{acc:.2f}"]
+            for a in ab_vals:
+                v = sam_vals[f"SAM_a{a}_b{a}"]
+                row.append(f"{v:.6f}" if not math.isnan(v) else "nan")
+            with open(metrics_csv, "a", newline="") as f:
+                csv.writer(f).writerow(row)
 
-        sam_vals = compute_sam(acc, totals["total_energy_j"], ab_vals)
-        row = [0, 0.0, f"{eval_time:.3f}", f"{eval_time:.3f}",
-               0.0, f"{totals['eval_energy_j']:.3f}", f"{totals['total_energy_j']:.3f}",
-               f"{totals['avg_power_w']:.3f}", f"{acc:.2f}"]
-        for a in ab_vals:
-            v = sam_vals[f"SAM_a{a}_b{a}"]
-            row.append(f"{v:.6f}" if not math.isnan(v) else "nan")
-        with open(metrics_csv, "a", newline="") as f:
-            csv.writer(f).writerow(row)
+            _best_str = f" | BestVal={best_val_acc:.2f}%" if use_earlystop else ""
+            print(f"[FT FINAL] Acc={acc:.2f}%{_best_str} "
+                  f"TrainT={total_train_time/60:.1f}min EvalT={eval_time/60:.1f}min")
 
     finally:
         pwr.close()
@@ -630,7 +1158,69 @@ def run_experiment(dataset_name):
     return metrics_csv
 
 
+def _parse_cli_args():
+    """CLI flags override the env-var-derived defaults. Env workflow still works:
+    unset flags fall back to the VLM_* defaults computed at import time."""
+    import argparse
+    ap = argparse.ArgumentParser(
+        description="PaliGemma-3B zero-shot / QLoRA on CIFAR-100 / DTD")
+    ap.add_argument("--mode", choices=["zero_shot", "projector_lora", "qlora"],
+                    default=FT_MODE, help="run mode (default from VLM_FT_MODE)")
+    ap.add_argument("--datasets", default=",".join(DATASETS),
+                    help="comma list, e.g. 'dtd' or 'cifar100,dtd'")
+    ap.add_argument("--skip-baseline", action="store_true", default=FT_SKIP_BASELINE,
+                    help="skip the zero-shot baseline eval before FT")
+    ap.add_argument("--epochs", type=int, default=FT_EPOCHS)
+    ap.add_argument("--steps", type=int, default=FT_STEPS_PER_EPOCH,
+                    help="train samples per epoch")
+    ap.add_argument("--grad-accum", type=int, default=FT_GRAD_ACCUM)
+    ap.add_argument("--lora-r", type=int, default=FT_LORA_R)
+    ap.add_argument("--lora-alpha", type=int, default=FT_LORA_ALPHA)
+    ap.add_argument("--lora-dropout", type=float, default=FT_LORA_DROPOUT)
+    ap.add_argument("--lr", type=float, default=None,
+                    help="LoRA LR (default 2e-4 for qlora, else 2e-5)")
+    ap.add_argument("--train-projector", action="store_true", default=FT_TRAIN_PROJECTOR)
+    ap.add_argument("--max-samples", type=int, default=MAX_SAMPLES,
+                    help="cap eval images (debug); default = full set")
+    ap.add_argument("--ft-prompt", choices=["eval", "short"], default=FT_PROMPT_MODE,
+                    help="train prompt: 'eval' matches the scoring prompt (recommended)")
+    ap.add_argument("--val-every", type=int, default=FT_VAL_EVERY,
+                    help="validate + early-stop check every N steps (0=off)")
+    ap.add_argument("--val-samples", type=int, default=FT_VAL_SAMPLES,
+                    help="held-out images used for validation")
+    ap.add_argument("--patience", type=int, default=FT_PATIENCE,
+                    help="stop after N validations without improvement")
+    return ap.parse_args()
+
+
 if __name__ == "__main__":
+    _args = _parse_cli_args()
+    FT_MODE            = _args.mode
+    DATASETS           = [d.strip() for d in _args.datasets.split(",") if d.strip()]
+    FT_SKIP_BASELINE   = _args.skip_baseline
+    FT_EPOCHS          = _args.epochs
+    FT_STEPS_PER_EPOCH = _args.steps
+    FT_GRAD_ACCUM      = _args.grad_accum
+    FT_LORA_R          = _args.lora_r
+    FT_LORA_ALPHA      = _args.lora_alpha
+    FT_LORA_DROPOUT    = _args.lora_dropout
+    FT_TRAIN_PROJECTOR = _args.train_projector
+    MAX_SAMPLES        = _args.max_samples
+    FT_PROMPT_MODE     = _args.ft_prompt
+    FT_VAL_EVERY       = _args.val_every
+    FT_VAL_SAMPLES     = _args.val_samples
+    FT_PATIENCE        = _args.patience
+    if _args.lr is not None:
+        FT_LR = _args.lr
+    elif FT_MODE == "qlora":
+        FT_LR = 2e-4   # re-derive: env default was for the import-time mode
+
+    print(f"[CONFIG] mode={FT_MODE} datasets={DATASETS} skip_baseline={FT_SKIP_BASELINE} "
+          f"epochs={FT_EPOCHS} steps={FT_STEPS_PER_EPOCH} grad_accum={FT_GRAD_ACCUM} "
+          f"lora_r={FT_LORA_R} lora_alpha={FT_LORA_ALPHA} lr={FT_LR:.1e}")
+    print(f"[CONFIG] ft_prompt={FT_PROMPT_MODE} val_every={FT_VAL_EVERY} "
+          f"val_samples={FT_VAL_SAMPLES} patience={FT_PATIENCE}")
+
     results = {}
     for ds in DATASETS:
         try:
