@@ -9,6 +9,7 @@ from typing import List, Dict, Tuple, Optional
 from datetime import datetime
 import copy
 import traceback
+import gc
 
 import torch
 import torch.nn as nn
@@ -35,6 +36,38 @@ except ImportError:
     PEFT_AVAILABLE = False
     print("Warning: 'peft' library not found.")
 
+# Monkey-patch AdaLoRA to handle Mamba SSM Triton kernels that do not populate
+# .grad for lora_E parameters (selective-scan custom autograd).  When grad is
+# None we treat the parameter's importance as zero, which is semantically
+# correct: parameters with no gradient carry no useful information for rank
+# allocation.
+if PEFT_AVAILABLE:
+    try:
+        from peft.tuners.adalora.layer import RankAllocator as _RankAllocator
+
+        def _patched_update_ipt(self, model):
+            for n, p in model.named_parameters():
+                if "lora_" in n and self.adapter_name in n:
+                    if n not in self.ipt:
+                        self.ipt[n] = torch.zeros_like(p)
+                        self.exp_avg_ipt[n] = torch.zeros_like(p)
+                        self.exp_avg_unc[n] = torch.zeros_like(p)
+                    with torch.no_grad():
+                        grad = p.grad if p.grad is not None else torch.zeros_like(p)
+                        self.ipt[n] = (p * grad).abs().detach()
+                        self.exp_avg_ipt[n] = (
+                            self.beta1 * self.exp_avg_ipt[n] + (1 - self.beta1) * self.ipt[n]
+                        )
+                        self.exp_avg_unc[n] = (
+                            self.beta2 * self.exp_avg_unc[n]
+                            + (1 - self.beta2) * (self.ipt[n] - self.exp_avg_ipt[n]).abs()
+                        )
+
+        _RankAllocator.update_ipt = _patched_update_ipt
+        print("[AdaLoRA] Patched RankAllocator.update_ipt for Mamba SSM compatibility.")
+    except Exception as _e:
+        print(f"[AdaLoRA] Monkey-patch failed (non-fatal): {_e}")
+
 try:
     import bitsandbytes as bnb
 
@@ -55,7 +88,7 @@ DEFAULT_DATA_ROOT = Path('./data')
 
 
 # Set env for better memory handling
-# os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "max_split_size_mb:128,garbage_collection_threshold:0.8"
+os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True,garbage_collection_threshold:0.8")
 
 def iso_now():
     return datetime.now().isoformat(timespec="seconds")
@@ -227,28 +260,48 @@ class BiMamba(nn.Module):
     def ssm(self, u, x_proj, dt_proj, A_log, D):
         # u: (B, D_inner, L)
         L = u.size(-1)
-        # x_proj takes (B, L, D_inner) -> needs transpose u
         x_dbl = x_proj(u.transpose(1, 2))  # (B, L, dt_rank + 2*d_state)
         d_dt_rank = self.dt_rank
         d_state = self.d_state
 
-        dt, B, C = torch.split(x_dbl, [d_dt_rank, d_state, d_state], dim=-1)
-        dt = dt_proj(dt).transpose(1, 2)  # (B, D_inner, L)
-        B = B.transpose(1, 2)
-        C = C.transpose(1, 2)
+        dt, B_ssm, C_ssm = torch.split(x_dbl, [d_dt_rank, d_state, d_state], dim=-1)
+        # Apply dt_proj weight only (no bias) — bias is handled separately
+        dt = nn.functional.linear(dt, dt_proj.weight).transpose(1, 2)  # (B, D_inner, L)
+        B_ssm = B_ssm.transpose(1, 2)     # (B, d_state, L)
+        C_ssm = C_ssm.transpose(1, 2)     # (B, d_state, L)
 
-        A = -torch.exp(A_log)
+        A = -torch.exp(A_log)  # (D_inner, d_state)
 
         if self.use_fast_path and selective_scan_fn is not None:
-            y = selective_scan_fn(
-                u, dt, A, B, C, D.float(), z=None, delta_bias=dt_proj.bias.float(), delta_softplus=True
-            )
-        else:
-            # Fallback or simple implementation if needed, but we expect fast path
-            # Minimal placeholder if fast path fails would be complex to write here
-            y = selective_scan_fn(
-                u, dt, A, B, C, D.float(), z=None, delta_bias=dt_proj.bias.float(), delta_softplus=True
-            )
+            try:
+                y = selective_scan_fn(
+                    u, dt, A, B_ssm, C_ssm, D.float(),
+                    z=None, delta_bias=dt_proj.bias.float(), delta_softplus=True
+                )
+                return y
+            except RuntimeError:
+                pass  # Fall through to Python fallback
+
+        # Pure-PyTorch SSM fallback (works with autograd, no custom CUDA)
+        # Add bias manually then apply softplus (matching selective_scan_fn convention)
+        dt = nn.functional.softplus(dt + dt_proj.bias.float().unsqueeze(0).unsqueeze(-1))
+        # dt: (B, D_inner, L),  A: (D_inner, d_state)
+        batch = u.shape[0]
+        d_inner = u.shape[1]
+        h = torch.zeros(batch, d_inner, d_state, device=u.device, dtype=u.dtype)
+        ys = []
+        for i in range(L):
+            dt_i = dt[:, :, i].unsqueeze(-1)          # (B, D_inner, 1)
+            B_i = B_ssm[:, :, i].unsqueeze(1)          # (B, 1, d_state)
+            C_i = C_ssm[:, :, i].unsqueeze(1)          # (B, 1, d_state)
+            u_i = u[:, :, i].unsqueeze(-1)             # (B, D_inner, 1)
+            dA = torch.exp(dt_i * A.unsqueeze(0))      # (B, D_inner, d_state)
+            dB = dt_i * B_i                             # (B, D_inner, d_state)
+            h = h * dA + u_i * dB
+            y_i = (h * C_i).sum(dim=-1)                # (B, D_inner)
+            y_i = y_i + D * u[:, :, i]
+            ys.append(y_i)
+        y = torch.stack(ys, dim=-1)  # (B, D_inner, L)
         return y
 
 
@@ -638,332 +691,616 @@ def load_pretrained_weights(model, model_name="vim_small_midclstok"):
     print(f"  Matched: {matched}/{len(state_dict)} checkpoint keys")
     return model
 
+# -------------------------------
+# Memory Logger (per-run files) with deferred sync
+# -------------------------------
+class MemLogger:
+    def __init__(self, device, n_layers: int, raw_log_gz: Path, epoch_avg_csv: Path,
+                 layer_times_gz: Path, layer_time_epoch_avg_csv: Path):
+        self.device = device
+        self.n_layers = n_layers
+        self.raw_path = raw_log_gz
+        self.epoch_avg_path = epoch_avg_csv
+        self.layer_times_path = layer_times_gz
+        self.layer_time_epoch_avg_path = layer_time_epoch_avg_csv
+
+        self.raw_file = gzip.open(self.raw_path, "at", newline="")
+        self.raw_writer = csv.writer(self.raw_file)
+        if self.raw_path.stat().st_size == 0:
+            self.raw_writer.writerow(["epoch","step","phase","layer","mem_mib"])
+        self.epoch_acc: Dict[Tuple[str, int], Tuple[float, int]] = {}
+
+        self.time_file = gzip.open(self.layer_times_path, "at", newline="")
+        self.time_writer = csv.writer(self.time_file)
+        if self.layer_times_path.stat().st_size == 0:
+            self.time_writer.writerow(["ts","epoch","step","phase","layer","ms"])
+        self.epoch_time_acc: Dict[Tuple[str, int], Tuple[float, int]] = {}
+        self.pending_events = []
+
+        first = (not self.layer_time_epoch_avg_path.exists()) or (self.layer_time_epoch_avg_path.stat().st_size == 0)
+        if first:
+            with open(self.layer_time_epoch_avg_path, "a", newline="") as f:
+                csv.writer(f).writerow(["epoch","x_label","phase","layer","avg_ms"])
+
+    @torch.no_grad()
+    def log_now(self, epoch: int, step: int, phase: str, layer_idx: int):
+        mem = torch.cuda.memory_allocated(self.device)
+        self.raw_writer.writerow([epoch, step, phase, layer_idx, f"{bytes_to_mib(mem):.3f}"])
+        key = (phase, layer_idx)
+        total, cnt = self.epoch_acc.get(key, (0.0, 0))
+        self.epoch_acc[key] = (total + bytes_to_mib(mem), cnt + 1)
+
+    def log_layer_time(self, epoch: int, step: int, phase: str, layer_idx: int, ms: float):
+        self.time_writer.writerow([iso_now(), epoch, step, phase, layer_idx, f"{ms:.3f}"])
+        key = (phase, layer_idx)
+        total, cnt = self.epoch_time_acc.get(key, (0.0, 0))
+        self.epoch_time_acc[key] = (total + ms, cnt + 1)
+
+    def buffer_layer_time(self, epoch, step, phase, layer_idx, start_ev, end_ev):
+        self.pending_events.append((epoch, step, phase, layer_idx, start_ev, end_ev))
+
+    def process_buffered_events(self):
+        if not self.pending_events:
+            return
+        torch.cuda.synchronize()
+        for epoch, step, phase, layer_idx, start, end in self.pending_events:
+            ms = start.elapsed_time(end)
+            self.time_writer.writerow([iso_now(), epoch, step, phase, layer_idx, f"{ms:.3f}"])
+            key = (phase, layer_idx)
+            total, cnt = self.epoch_time_acc.get(key, (0.0, 0))
+            self.epoch_time_acc[key] = (total + ms, cnt + 1)
+        self.pending_events.clear()
+
+    def reset_epoch_acc(self):
+        self.epoch_acc.clear()
+        self.epoch_time_acc.clear()
+        self.pending_events.clear()
+
+    def flush_epoch_avg(self, epoch: int):
+        self.process_buffered_events()
+        first_write = (not self.epoch_avg_path.exists()) or (self.epoch_avg_path.stat().st_size == 0)
+        with open(self.epoch_avg_path, "a", newline="") as f:
+            w = csv.writer(f)
+            if first_write:
+                w.writerow(["epoch","x_label","phase","layer","mem_mib"])
+            for i in range(1, self.n_layers + 1):
+                total, cnt = self.epoch_acc.get(("fwd", i), (0.0, 1))
+                w.writerow([epoch, f"fwd-L{i}", "fwd", i, f"{(total/cnt):.3f}"])
+            for i in range(self.n_layers, 0, -1):
+                total, cnt = self.epoch_acc.get(("bwd", i), (0.0, 1))
+                w.writerow([epoch, f"bwd-L{i}", "bwd", i, f"{(total/cnt):.3f}"])
+        with open(self.layer_time_epoch_avg_path, "a", newline="") as f:
+            w = csv.writer(f)
+            for i in range(1, self.n_layers + 1):
+                tot, cnt = self.epoch_time_acc.get(("fwd", i), (0.0, 0))
+                if cnt > 0:
+                    w.writerow([epoch, f"fwd-L{i}", "fwd", i, f"{(tot/cnt):.3f}"])
+            for i in range(self.n_layers, 0, -1):
+                tot, cnt = self.epoch_time_acc.get(("bwd", i), (0.0, 0))
+                if cnt > 0:
+                    w.writerow([epoch, f"bwd-L{i}", "bwd", i, f"{(tot/cnt):.3f}"])
+
+    def close(self):
+        try: self.raw_file.close()
+        except Exception: pass
+        try: self.time_file.close()
+        except Exception: pass
+
+
+class SmoothedValue:
+    def __init__(self, momentum=0.98):
+        self.m = None
+        self.beta = momentum
+    def update(self, x):
+        self.m = x if self.m is None else self.beta * self.m + (1 - self.beta) * x
+    @property
+    def value(self):
+        return float(self.m) if self.m is not None else float("nan")
+
 
 # -------------------------------
-# Training Logic per Run
+# Eval
 # -------------------------------
+def run_eval(model, loader, device, pwr, epoch_idx=-1):
+    model.eval()
+    criterion = nn.CrossEntropyLoss()
+    correct, total = 0, 0
+    total_loss = 0.0
+    start_t = time.time()
+    with torch.no_grad():
+        for step, (x, y) in enumerate(loader):
+            torch.cuda.synchronize()
+            p_start = pwr.sample_power_w()
+            t0 = time.time()
+            x = x.to(device, non_blocking=True)
+            y = y.to(device, non_blocking=True)
+            logits = model(x)
+            loss = criterion(logits, y)
+            pred = logits.argmax(dim=1)
+            correct += (pred == y).sum().item()
+            total += y.size(0)
+            total_loss += loss.item() * x.size(0)
+            torch.cuda.synchronize()
+            step_t = time.time() - t0
+            p_end = pwr.sample_power_w()
+            pwr.log_step("eval", epoch_idx, step, step_t, p_start, p_end)
+    total_time = time.time() - start_t
+    acc = 100.0 * correct / total if total > 0 else 0.0
+    avg_loss = total_loss / total if total > 0 else 0.0
+    return acc, avg_loss, total_time
+
+
 # -------------------------------
-# Training Logic per Run
+# Memory / Timing Hooks
 # -------------------------------
-def train_one_run(dataset_name: str, batch_size: int, peft_method: str, args, device: torch.device, base_outdir: Path):
-    run_id = f"{dataset_name}_bs{batch_size}_{peft_method}"
-    outdir = base_outdir / run_id
+def attach_mem_hooks(model, memlog, epoch_ref, step_ref):
+    handles = []
+    fwd_start_events = {}
+    bwd_start_events = {}
+
+    def make_fwd_pre(idx):
+        def _hook(module, inp):
+            memlog.log_now(epoch_ref(), step_ref(), "fwd", idx)
+            ev = torch.cuda.Event(enable_timing=True)
+            ev.record(torch.cuda.current_stream())
+            fwd_start_events[idx] = ev
+        return _hook
+
+    def make_fwd_end(idx):
+        def _hook(module, inp, out):
+            end = torch.cuda.Event(enable_timing=True)
+            end.record(torch.cuda.current_stream())
+            # Use deferred sync to avoid blocking GPU pipeline mid-forward
+            start = fwd_start_events.pop(idx, None)
+            if start is not None:
+                memlog.buffer_layer_time(epoch_ref(), step_ref(), "fwd", idx, start, end)
+        return _hook
+
+    have_bwd_pre = hasattr(nn.Module, "register_full_backward_pre_hook")
+
+    def make_bwd_pre(idx):
+        def _hook(module, grad_input):
+            ev = torch.cuda.Event(enable_timing=True)
+            ev.record(torch.cuda.current_stream())
+            bwd_start_events[idx] = ev
+        return _hook
+
+    def make_bwd_end(idx):
+        def _hook(module, grad_input, grad_output):
+            end = torch.cuda.Event(enable_timing=True)
+            end.record(torch.cuda.current_stream())
+            # Use deferred sync to avoid blocking GPU pipeline
+            start = bwd_start_events.pop(idx, None)
+            if start is not None:
+                memlog.buffer_layer_time(epoch_ref(), step_ref(), "bwd", idx, start, end)
+            memlog.log_now(epoch_ref(), step_ref(), "bwd", idx)
+        return _hook
+
+    blocks = list(model.layers)
+    for i, block in enumerate(blocks, start=1):
+        handles.append(block.register_forward_pre_hook(make_fwd_pre(i), with_kwargs=False))
+        handles.append(block.register_forward_hook(make_fwd_end(i)))
+        if have_bwd_pre:
+            handles.append(block.register_full_backward_pre_hook(make_bwd_pre(i)))
+        handles.append(block.register_full_backward_hook(make_bwd_end(i)))
+    return handles
+
+
+# -------------------------------
+# Adaptive Dynamic Checkpointing
+# -------------------------------
+def inject_dynamic_checkpointing(model, device, mem_cap_bytes, step_ref, memlog, epoch_ref, pwr=None, threshold_ratio=0.8):
+    blocks = list(model.layers)
+    for layer_idx, block in enumerate(blocks, start=1):
+        orig_forward = block.forward
+        block._ckpt_last_step = -1
+        block._use_ckpt_after = False
+        block._in_recompute = False
+
+        def make_forward(b, orig_fwd, li):
+            def forward(x):
+                if not torch.is_grad_enabled():
+                    return orig_fwd(x)
+                cur_step = step_ref()
+                if getattr(b, "_ckpt_last_step", -1) != cur_step:
+                    b._ckpt_last_step = cur_step
+                    b._use_ckpt_after = False
+                if getattr(b, "_in_recompute", False):
+                    return orig_fwd(x)
+                if not b._use_ckpt_after:
+                    cur_bytes = torch.cuda.memory_allocated(device=device)
+                    if cur_bytes >= threshold_ratio * mem_cap_bytes:
+                        b._use_ckpt_after = True
+                if not b._use_ckpt_after:
+                    return orig_fwd(x)
+
+                def run_block(inp):
+                    memlog.log_now(epoch_ref(), step_ref(), "fwd_re", li)
+                    start_ev = torch.cuda.Event(enable_timing=True)
+                    end_ev = torch.cuda.Event(enable_timing=True)
+                    start_ev.record(torch.cuda.current_stream())
+                    t0 = time.time()
+                    p_start = pwr.sample_power_w() if pwr else float("nan")
+                    was = b._in_recompute
+                    b._in_recompute = True
+                    try:
+                        out = orig_fwd(inp)
+                    finally:
+                        b._in_recompute = was
+                    end_ev.record(torch.cuda.current_stream())
+                    memlog.buffer_layer_time(epoch_ref(), step_ref(), "fwd_re", li, start_ev, end_ev)
+                    if pwr:
+                        pwr.log_step("train_fwd_re", epoch_ref(), step_ref(), time.time()-t0, p_start, pwr.sample_power_w())
+                    return out
+                return checkpoint(run_block, x, use_reentrant=False)
+            return forward
+        block.forward = make_forward(block, orig_forward, layer_idx)
+
+
+# -------------------------------
+# QLoRA quantization
+# -------------------------------
+def quantize_mamba_model_in_place(model):
+    """Replace nn.Linear layers with bnb.nn.Linear4bit for 4-bit NF4 quantization.
+    Skips: head (classification), dt_proj/dt_proj_b (accessed via .weight/.bias
+    directly in ssm()), and Conv layers (conv1d, PatchEmbed)."""
+    if not BNB_AVAILABLE:
+        raise ImportError("bitsandbytes not installed. Needed for QLoRA.")
+    # dt_proj layers are used via F.linear(x, dt_proj.weight) and dt_proj.bias
+    # inside ssm(), so their weight must remain uncompressed.
+    SKIP_NAMES = {"head", "dt_proj", "dt_proj_b"}
+    print("[QLoRA] Quantizing Mamba model layers to 4-bit NF4...")
+
+    def replace_linear(module, name_prefix=""):
+        for name, child in module.named_children():
+            full_name = f"{name_prefix}.{name}" if name_prefix else name
+            if any(s in full_name.split(".") for s in SKIP_NAMES):
+                continue
+            if isinstance(child, nn.Linear):
+                new_layer = bnb.nn.Linear4bit(
+                    child.in_features,
+                    child.out_features,
+                    bias=child.bias is not None,
+                    compute_dtype=torch.float16,
+                    quant_type="nf4",
+                )
+                new_layer.weight.data.copy_(child.weight.data)
+                if child.bias is not None:
+                    new_layer.bias.data.copy_(child.bias.data)
+                setattr(module, name, new_layer)
+            else:
+                replace_linear(child, full_name)
+
+    replace_linear(model)
+    return model
+
+
+# -------------------------------
+# Training Logic
+# -------------------------------
+def train_single_run(args, dataset, peft_method, ckpt_mode):
+    run_label = f"{dataset}/{peft_method}_{ckpt_mode}"
+    print(f"\n{'='*80}\nSTARTING: {run_label}\n{'='*80}")
+    set_seed(SEED)
+    device = ensure_cuda()
+
+    total_bytes = torch.cuda.get_device_properties(0).total_memory
+    cap_bytes = int(max(0.1, MEMORY_CAPACITY_GB) * (1024**3))
+    try:
+        if ckpt_mode == "adaptive" or ckpt_mode == "static":
+            frac = min(0.99, cap_bytes / total_bytes)
+            torch.cuda.set_per_process_memory_fraction(frac, device=0)
+            print(f"[GPU MEM CAP] ~{MEMORY_CAPACITY_GB:.2f} GB ({frac*100:.1f}%)")
+        else:
+            torch.cuda.set_per_process_memory_fraction(0.99, device=0)
+            print(f"[GPU MEM] Full memory (ckpt_mode={ckpt_mode})")
+    except Exception:
+        pass
+
+    ab_vals = sorted(set(int(s) for s in args.sam_ab.split(",") if s.strip()))
+    outdir = Path(args.outdir) / dataset / f"{peft_method}_{ckpt_mode}"
     outdir.mkdir(parents=True, exist_ok=True)
+    print(f"[RUN DIR] {outdir}")
 
-    metrics_path = outdir / "metrics.csv"
-    power_path = outdir / "power.csv.gz"
+    raw_log_gz = outdir / "memlog_raw.csv.gz"
+    epoch_avg_csv = outdir / "memlog_epoch_avg.csv"
+    layer_times_gz = outdir / "layer_times.csv.gz"
+    layer_time_epoch_avg_csv = outdir / "layer_time_epoch_avg.csv"
+    step_energy_gz = outdir / "step_energy.csv.gz"
+    metrics_csv = outdir / "epoch_metrics.csv"
+    ensure_metrics_csv_header(ab_vals, metrics_csv)
 
-    # SAM parameters
-    ab_values = [1, 2, 3, 4, 5]
-    ensure_metrics_csv_header(ab_values, metrics_path)
-
-    print(f"\n{'=' * 40}")
-    print(f"STARTING RUN: {run_id}")
-    print(f"Dataset: {dataset_name} | Batch Size: {batch_size} | Mode: {peft_method}")
-    print(f"{'=' * 40}\n")
-
-    # 1. Data
-    print(f"Loading {dataset_name}...")
-    if dataset_name == "dtd":
-        train_loader, val_loader, num_classes = make_dataloaders_dtd(
-            STEPS_PER_EPOCH, batch_size, NUM_WORKERS, args.data_root, True
-        )
+    # Data
+    if dataset == "cifar100":
+        train_loader, test_loader, num_classes = make_dataloaders_cifar100(
+            args.steps_per_epoch, args.batch_size, NUM_WORKERS,
+            args.data_root, True, args.eval_batch_size)
+        print(f"[CIFAR-100] num_classes={num_classes}")
     else:
-        train_loader, val_loader, num_classes = make_dataloaders_cifar100(
-            STEPS_PER_EPOCH, batch_size, NUM_WORKERS, args.data_root, True
-        )
+        train_loader, test_loader, num_classes = make_dataloaders_dtd(
+            args.steps_per_epoch, args.batch_size, NUM_WORKERS,
+            args.data_root, True, args.eval_batch_size)
+        print(f"[DTD] num_classes={num_classes}")
 
-    # 2. Model
-    print("Creating Vision Mamba (Vim-Small equivalent)...")
-    mid_cls_token = False
-    bidirectional = False
+    lr = args.lr_fullft if peft_method == "none" else args.lr
+    print(f"[LR] {lr:.1e} ({'FullFT' if peft_method == 'none' else peft_method})")
+
+    # Model
+    mid_cls, bidir = False, False
     if args.pretrained:
-        mid_cls_token = True  # Official Vim-Small-MidCls uses this strategy
-        bidirectional = True
-        print("Using Mid-Cls-Token & BiMamba Strategy for Pretrained Weights")
+        mid_cls, bidir = True, True
+        print("Using Mid-Cls-Token & BiMamba for pretrained weights")
 
     model = VisionMamba(
-        img_size=224,
-        patch_size=16,
-        depth=24,
-        embed_dim=384,
-        d_state=16,
-        d_conv=4,
-        expand=2,
-        num_classes=num_classes,
-        mid_cls_token=mid_cls_token,
-        bidirectional=bidirectional
-    )
+        img_size=224, patch_size=16, depth=24, embed_dim=384,
+        d_state=16, d_conv=4, expand=2, num_classes=num_classes,
+        mid_cls_token=mid_cls, bidirectional=bidir)
 
     if args.pretrained:
         model = load_pretrained_weights(model, "vim_small_midclstok")
 
-    # 3. PEFT & LR
-    if peft_method == "none":
-        lr = 2e-5
-        print(f"[Mode: FullFT] Learning Rate: {lr}")
-    else:
-        lr = 5e-4
-        print(f"[Mode: {peft_method}] Learning Rate: {lr}")
-
-    if peft_method == "qlora" and BNB_AVAILABLE:
-        print(
-            "Applying QLoRA (4-bit placeholder/quantization not fully implemented here, using standard LoRA + load checks if needed)...")
-        # In a real QLoRA setup, we would load the model in 4bit using BitsAndBytesConfig
-        # Here we just treat it as LoRA logic for simplicity unless user provided 4bit loaded model
-        pass
-
+    # PEFT
     target_modules = ["in_proj", "x_proj", "dt_proj", "out_proj", "proj"]
-
-    if peft_method in ["lora", "qlora"]:
-        print(f"Applying LoRA (r={args.lora_r})...")
-        config = LoraConfig(
-            r=args.lora_r,
-            lora_alpha=args.lora_r * 2,
-            target_modules=target_modules,
-            lora_dropout=0.1,
-            bias="none",
-            modules_to_save=["head"],
-        )
+    if peft_method == "qlora":
+        model = quantize_mamba_model_in_place(model)
+        model.to(device)
+        model = prepare_model_for_kbit_training(model)
+        config = LoraConfig(r=args.lora_r, lora_alpha=args.lora_r*2,
+                            target_modules=target_modules, lora_dropout=0.1,
+                            bias="none", modules_to_save=["head"])
         model = get_peft_model(model, config)
         model.print_trainable_parameters()
-
+    elif peft_method == "lora":
+        config = LoraConfig(r=args.lora_r, lora_alpha=args.lora_r*2,
+                            target_modules=target_modules, lora_dropout=0.1,
+                            bias="none", modules_to_save=["head"])
+        model = get_peft_model(model, config)
+        model.print_trainable_parameters()
     elif peft_method == "adalora":
-        print(f"Applying AdaLoRA (r={args.lora_r})...")
-        total_steps = args.epochs * STEPS_PER_EPOCH
-        # AdaLoRA does not support Conv2d (proj), so we exclude it
-        adalora_targets = ["in_proj", "x_proj", "dt_proj", "out_proj"]
-        config = AdaLoraConfig(
-            r=args.lora_r,
-            lora_alpha=args.lora_r * 2,
-            target_modules=adalora_targets,
-            lora_dropout=0.1,
-            bias="none",
-            modules_to_save=["head"],
-            # AdaLoRA specific
-            init_r=12,
-            tinit=200,
-            tfinal=1000,
-            deltaT=10,
-            total_step=total_steps
-        )
+        total_steps = args.epochs * args.steps_per_epoch
+        config = AdaLoraConfig(r=args.lora_r, lora_alpha=args.lora_r*2,
+                               target_modules=["in_proj","x_proj","dt_proj","out_proj"],
+                               lora_dropout=0.1, bias="none", modules_to_save=["head"],
+                               init_r=12, tinit=200, tfinal=1000, deltaT=10,
+                               total_step=total_steps)
         model = get_peft_model(model, config)
         model.print_trainable_parameters()
-
     elif peft_method == "bitfit":
-        print("Applying BitFit (Bias-Tuning)...")
-        # Freeze all
-        for name, param in model.named_parameters():
-            param.requires_grad = False
-
-        # Unfreeze bias and head
-        trainable_count = 0
-        total_count = 0
-        for name, param in model.named_parameters():
-            if "bias" in name or "head" in name:
-                param.requires_grad = True
-                trainable_count += param.numel()
-            total_count += param.numel()
-
-        print(
-            f"BitFit: Trainable params: {trainable_count / 1e6:.2f}M / {total_count / 1e6:.2f}M ({trainable_count / total_count * 100:.2f}%)")
-
+        for p in model.parameters(): p.requires_grad = False
+        cnt_t, cnt_all = 0, 0
+        for n, p in model.named_parameters():
+            if "bias" in n or "head" in n:
+                p.requires_grad = True
+                cnt_t += p.numel()
+            cnt_all += p.numel()
+        print(f"BitFit: {cnt_t/1e6:.2f}M / {cnt_all/1e6:.2f}M ({cnt_t/cnt_all*100:.2f}%)")
     else:
-        if peft_method != "none":
-            print(f"Warning: Unknown PEFT method {peft_method}, defaulting to full fine-tuning.")
-        print(f"Full Fine-Tuning / Training From Scratch")
-        print(f"Total Parameters: {sum(p.numel() for p in model.parameters()) / 1e6:.2f}M")
+        print(f"Full Fine-Tuning: {sum(p.numel() for p in model.parameters())/1e6:.2f}M params")
+
+    use_static_ckpt = (ckpt_mode == "static")
+    if use_static_ckpt:
+        print("[Checkpoint] Static gradient checkpointing enabled")
 
     model.to(device)
-
     trainable_params = [p for p in model.parameters() if p.requires_grad]
-    optimizer = torch.optim.AdamW(trainable_params, lr=lr, weight_decay=0.05)
+    optimizer = torch.optim.AdamW(trainable_params, lr=lr, weight_decay=args.weight_decay)
     criterion = nn.CrossEntropyLoss()
-    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=args.epochs)
+    scaler = torch.amp.GradScaler('cuda', enabled=args.amp)
 
-    pwr = GpuPowerMeter(0, power_path)
+    cur_epoch = {"v": 0}
+    cur_step = {"v": 0}
+    global_step = {"v": 0}
+    epoch_ref = lambda: cur_epoch["v"]
+    step_ref = lambda: cur_step["v"]
 
-    best_acc = 0.0
-    global_step = 0
+    base_model = model.base_model.model if hasattr(model, "base_model") and hasattr(model.base_model, "model") else model
+    n_blocks = len(list(base_model.layers))
+    print(f"Found {n_blocks} Vim blocks")
 
-    # Baseline eval (epoch 0)
-    model.eval()
-    val_correct_base = 0
-    val_total_base = 0
-    with torch.no_grad():
-        for x, y in val_loader:
-            x, y = x.to(device), y.to(device)
-            out = model(x)
-            pred = out.argmax(dim=1)
-            val_correct_base += (pred == y).sum().item()
-            val_total_base += y.size(0)
-            if args.dry_run: break
-    base_acc = val_correct_base / val_total_base if val_total_base > 0 else 0
-    print(f"[BASELINE] Acc={base_acc*100:.2f}%")
+    memlog = MemLogger(device, n_blocks, raw_log_gz, epoch_avg_csv, layer_times_gz, layer_time_epoch_avg_csv)
+    pwr = GpuPowerMeter(device_index=0, step_energy_path=step_energy_gz)
 
-    with open(metrics_path, "a", newline="") as f:
-        w = csv.writer(f)
-        row = [0, "0.000", "0.000", "0.000", "0.000", "0.000", "0.000", "0.000", f"{base_acc*100:.2f}"]
-        for _ in ab_values: row.append("nan")
-        w.writerow(row)
+    if ckpt_mode == "adaptive":
+        inject_dynamic_checkpointing(base_model, device=device, mem_cap_bytes=cap_bytes,
+                                     step_ref=step_ref, memlog=memlog, epoch_ref=epoch_ref,
+                                     pwr=pwr, threshold_ratio=0.50)
 
-    for epoch in range(args.epochs):
+    handles = attach_mem_hooks(base_model, memlog, epoch_ref, step_ref)
+
+    try:
+        # Baseline
         pwr.reset_epoch()
-        model.train()
-        total_loss = 0
-        correct = 0
-        total = 0
+        base_acc, base_loss, base_time = run_eval(model, test_loader, device, pwr, epoch_idx=0)
+        print(f"[BASELINE] Acc={base_acc:.2f}% Loss={base_loss:.4f} Time={base_time:.2f}s")
+        with open(metrics_csv, "a", newline="") as f:
+            row = [0, 0.0, f"{base_time:.3f}", f"{base_time:.3f}", 0.0, 0.0, 0.0, 0.0, f"{base_acc:.2f}"]
+            for _ in ab_vals: row.append("nan")
+            csv.writer(f).writerow(row)
 
-        pbar = tqdm(train_loader, desc=f"[{run_id}] Ep {epoch + 1}/{args.epochs}")
-        for step, (x, y) in enumerate(pbar):
-            torch.cuda.synchronize()
-            p_start = pwr.sample_power_w()
-            t0 = time.time()
+        # Free Triton/eval workspace before training allocates activation graph
+        gc.collect()
+        torch.cuda.empty_cache()
+        torch.cuda.synchronize()
 
-            x, y = x.to(device, non_blocking=True), y.to(device, non_blocking=True)
+        for epoch in range(1, args.epochs + 1):
+            cur_epoch["v"] = epoch
+            memlog.reset_epoch_acc()
+            pwr.reset_epoch()
+            model.train()
+            torch.cuda.reset_peak_memory_stats(device)
+            loss_smooth = SmoothedValue(0.98)
+            t_epoch = time.time()
 
-            optimizer.zero_grad(set_to_none=True)
-            out = model(x)
-            loss = criterion(out, y)
-            loss.backward()
+            iterator = enumerate(train_loader, start=1)
+            if not args.no_progress:
+                iterator = tqdm(iterator, total=args.steps_per_epoch, ncols=120, leave=False, desc=f"Epoch {epoch}")
 
-            # AdaLoRA: update rank budget after backward, before step
-            if peft_method == "adalora" and hasattr(model, "base_model") and hasattr(model.base_model, "update_and_allocate"):
-                model.base_model.update_and_allocate(global_step)
-
-            optimizer.step()
-            global_step += 1
-
-            # Record stats
-            torch.cuda.synchronize()
-            step_t = time.time() - t0
-            p_end = pwr.sample_power_w()
-            pwr.log_step("train", epoch + 1, step, step_t, p_start, p_end)
-
-            total_loss += loss.item()
-            pred = out.argmax(dim=1)
-            correct += (pred == y).sum().item()
-            total += y.size(0)
-
-            pbar.set_postfix({"loss": f"{loss.item():.4f}", "acc": f"{correct / total:.3f}"})
-
-            if args.dry_run:
-                break
-
-        if not args.dry_run:
-            scheduler.step()
-
-        # Validation
-        model.eval()
-        val_correct = 0
-        val_total = 0
-
-        # Eval loop with power logging too
-        with torch.no_grad():
-            for step, (x, y) in enumerate(val_loader):
+            for step, (x, y) in iterator:
+                cur_step["v"] = step
                 torch.cuda.synchronize()
                 p_start = pwr.sample_power_w()
                 t0 = time.time()
+                x = x.to(device, non_blocking=True)
+                y = y.to(device, non_blocking=True)
+                # AdaLoRA's update_ipt does `p * p.grad` and crashes if grad is None.
+                # set_to_none=False keeps zero tensors for params not in the compute graph.
+                optimizer.zero_grad(set_to_none=(peft_method != "adalora"))
 
-                x, y = x.to(device, non_blocking=True), y.to(device, non_blocking=True)
-                out = model(x)
-                pred = out.argmax(dim=1)
-                val_correct += (pred == y).sum().item()
-                val_total += y.size(0)
+                if use_static_ckpt:
+                    x_feat = base_model.patch_embed(x)
+                    B, N, C = x_feat.shape
+                    if base_model.mid_cls_token:
+                        cls_tok = base_model.cls_token.expand(B, -1, -1)
+                        mid = N // 2
+                        x_feat = torch.cat((x_feat[:,:mid,:], cls_tok, x_feat[:,mid:,:]), dim=1)
+                    else:
+                        cls_tok = base_model.cls_token.expand(B, -1, -1)
+                        x_feat = torch.cat((cls_tok, x_feat), dim=1)
+                    x_feat = x_feat + base_model.pos_embed
+                    x_feat = base_model.pos_drop(x_feat)
+                    for layer in base_model.layers:
+                        x_feat = checkpoint(layer, x_feat, use_reentrant=False)
+                    x_feat = base_model.norm_f(x_feat)
+                    if base_model.mid_cls_token:
+                        x_feat = x_feat[:, base_model.patch_embed.num_patches // 2]
+                    else:
+                        x_feat = x_feat[:, 0]
+                    out = base_model.head(x_feat) if not hasattr(model, "base_model") else model.head(x_feat)
+                    loss = criterion(out, y)
+                else:
+                    if args.amp:
+                        with torch.cuda.amp.autocast():
+                            out = model(x)
+                            loss = criterion(out, y)
+                    else:
+                        out = model(x)
+                        loss = criterion(out, y)
+
+                if args.amp:
+                    scaler.scale(loss).backward()
+                else:
+                    loss.backward()
+
+                if args.amp:
+                    scaler.step(optimizer)
+                    scaler.update()
+                else:
+                    optimizer.step()
+                global_step["v"] += 1
+
+                if peft_method == "adalora" and hasattr(model, "base_model") and hasattr(model.base_model, "update_and_allocate"):
+                    model.base_model.update_and_allocate(global_step["v"])
 
                 torch.cuda.synchronize()
                 step_t = time.time() - t0
                 p_end = pwr.sample_power_w()
-                pwr.log_step("eval", epoch + 1, step, step_t, p_start, p_end)
+                pwr.log_step("train", epoch, step, step_t, p_start, p_end)
+                loss_smooth.update(loss.item())
+                memlog.process_buffered_events()
 
-                if args.dry_run: break
+                if step % args.log_interval == 0:
+                    alloc = bytes_to_mib(torch.cuda.memory_allocated(device))
+                    peak = bytes_to_mib(torch.cuda.max_memory_allocated(device))
+                    print(f"[E{epoch:02d} S{step:05d}] loss={loss.item():.4f} sm={loss_smooth.value:.4f} alloc={alloc:.0f}MiB peak={peak:.0f}MiB")
 
-        val_acc = val_correct / val_total if val_total > 0 else 0
-        print(f"Epoch {epoch + 1} Val Acc: {val_acc:.4f}")
+                if step >= args.steps_per_epoch:
+                    break
 
-        # Metrics logging
-        totals = pwr.epoch_totals()
-        sam_res = compute_sam(val_acc * 100, totals['total_energy_j'], ab_values)
+            dt_train = time.time() - t_epoch
+            acc, val_loss, dt_eval = run_eval(model, test_loader, device, pwr, epoch_idx=epoch)
+            memlog.flush_epoch_avg(epoch)
+            totals = pwr.epoch_totals()
+            sam_vals = compute_sam(acc, totals["total_energy_j"], ab_vals)
+            peak_epoch = bytes_to_mib(torch.cuda.max_memory_allocated(device))
 
-        with open(metrics_path, "a", newline="") as f:
-            w = csv.writer(f)
-            # ["epoch","train_time_s","eval_time_s","total_time_s","train_energy_j","eval_energy_j","total_energy_j","avg_power_w","test_acc_pct"] + SAMs
-            row = [
-                epoch + 1,
-                f"{totals['train_time_s']:.3f}",
-                f"{totals['eval_time_s']:.3f}",
-                f"{totals['total_time_s']:.3f}",
-                f"{totals['train_energy_j']:.3f}",
-                f"{totals['eval_energy_j']:.3f}",
-                f"{totals['total_energy_j']:.3f}",
-                f"{totals['avg_power_w']:.3f}",
-                f"{val_acc * 100:.2f}"
-            ]
-            for a in ab_values:
-                key = f"SAM_a{a}_b{a}"
-                sam_val = sam_res.get(key, float("nan"))
-                row.append(f"{sam_val:.6f}" if not math.isnan(sam_val) else "nan")
-            w.writerow(row)
+            print(f"[Epoch {epoch}/{args.epochs}] Acc={acc:.2f}% TrainT={dt_train/60:.1f}m EvalT={dt_eval:.1f}s Energy={totals['total_energy_j']:.0f}J Peak={peak_epoch:.0f}MiB")
 
-        # Save Best & Last
-        if val_acc > best_acc:
-            best_acc = val_acc
-            torch.save(model.state_dict(), outdir / "best_model.pth")
-            with open(outdir / "best_acc.txt", "w") as f:
-                f.write(f"{best_acc:.4f}")
+            row = [epoch, f"{totals['train_time_s']:.3f}", f"{totals['eval_time_s']:.3f}",
+                   f"{totals['total_time_s']:.3f}", f"{totals['train_energy_j']:.3f}",
+                   f"{totals['eval_energy_j']:.3f}", f"{totals['total_energy_j']:.3f}",
+                   f"{totals['avg_power_w']:.3f}", f"{acc:.2f}"]
+            for a in ab_vals:
+                v = sam_vals[f"SAM_a{a}_b{a}"]
+                row.append(f"{v:.6f}" if not math.isnan(v) else "nan")
+            with open(metrics_csv, "a", newline="") as f:
+                csv.writer(f).writerow(row)
 
-        torch.save(model.state_dict(), outdir / f"last_model.pth")
+    finally:
+        for h in handles: h.remove()
+        memlog.close()
+        pwr.close()
+        torch.cuda.empty_cache()
 
-        if args.dry_run:
-            print("Dry run finished.")
-            break
 
-    pwr.close()
-    print(f"Finished Run: {run_id} | Best Acc: {best_acc:.4f}\n")
+# -------------------------------
+# Args & Multi-Experiment Runner
+# -------------------------------
+def parse_args():
+    ap = argparse.ArgumentParser(description="Vim-Small: DTD/CIFAR-100 with PEFT + adaptive checkpointing")
+    ap.add_argument("--epochs", type=int, default=EPOCHS)
+    ap.add_argument("--steps-per-epoch", type=int, default=STEPS_PER_EPOCH)
+    ap.add_argument("--batch-size", type=int, default=32)
+    ap.add_argument("--eval-batch-size", type=int, default=32)
+    ap.add_argument("--lr", type=float, default=5e-4, help="PEFT learning rate")
+    ap.add_argument("--lr-fullft", type=float, default=1e-5, help="FullFT learning rate")
+    ap.add_argument("--weight-decay", type=float, default=0.05)
+    ap.add_argument("--log-interval", type=int, default=200)
+    ap.add_argument("--no-progress", action="store_true")
+    ap.add_argument("--amp", action="store_true")
+    ap.add_argument("--sam-ab", type=str, default="1,2,3,4,5")
+    ap.add_argument("--datasets", nargs="+", default=["cifar100","dtd"], choices=["cifar100","dtd"])
+    ap.add_argument("--peft-methods", nargs="+", default=["none","bitfit"],
+                    choices=["none","bitfit","lora","qlora","adalora"])
+    ap.add_argument("--ckpt-modes", nargs="+", default=["static"],
+                    choices=["none","static","adaptive"])
+    ap.add_argument("--outdir", type=str, default=str(DEFAULT_OUTDIR))
+    ap.add_argument("--data-root", type=str, default=str(DEFAULT_DATA_ROOT))
+    ap.add_argument("--lora-r", type=int, default=8)
+    ap.add_argument("--pretrained", action="store_true", help="Load official Vim-Small-MidCls weights")
+    return ap.parse_args()
 
 
 def main():
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--datasets", type=str, nargs='+', default=["cifar100", "dtd"], help="List of datasets")
-    parser.add_argument("--batch_sizes", type=int, nargs='+', default=[32], help="List of batch sizes")
+    args = parse_args()
+    ds_list = args.datasets
+    peft_list = args.peft_methods
+    ckpt_list = args.ckpt_modes
+    total = len(ds_list) * len(peft_list) * len(ckpt_list)
 
-    parser.add_argument("--data_root", type=str, default=str(DEFAULT_DATA_ROOT))
-    parser.add_argument("--outdir", type=str, default=str(DEFAULT_OUTDIR))
-    parser.add_argument("--epochs", type=int, default=EPOCHS)
+    print(f"\n{'#'*80}")
+    print(f"EXPERIMENT MATRIX: {total} runs")
+    print(f"  Datasets:    {ds_list}")
+    print(f"  PEFT:        {peft_list}")
+    print(f"  Checkpoints: {ckpt_list}")
+    print(f"  Pretrained:  {args.pretrained}")
+    print(f"{'#'*80}\n")
 
-    # Updated choices including 'all', 'adalora', 'bitfit'
-    parser.add_argument("--peft", type=str, choices=["none", "lora", "qlora", "adalora", "bitfit", "all"],
-                        default="none")
-    parser.add_argument("--lora_r", type=int, default=8)
-    parser.add_argument("--dry_run", action="store_true", help="Run 1 step to verify")
-    parser.add_argument("--pretrained", action="store_true", help="Load official Vim-Small-MidCls ImageNet weights")
-
-    args = parser.parse_args()
-
-    set_seed(SEED)
-    device = ensure_cuda()
-    base_outdir = Path(args.outdir)
-    base_outdir.mkdir(parents=True, exist_ok=True)
-
-    # Determine PEFT methods list
-    if args.peft == "all":
-        peft_methods = ["none", "lora", "qlora", "adalora", "bitfit"]
-    else:
-        peft_methods = [args.peft]
-
-    print(f"Planned Runs: Datasets={args.datasets}, BatchSizes={args.batch_sizes}, PEFT={peft_methods}")
-
-    for dataset in args.datasets:
-        for batch_size in args.batch_sizes:
-            for peft_method in peft_methods:
+    completed, failed = [], []
+    idx = 0
+    for ds in ds_list:
+        for peft in peft_list:
+            for ckpt in ckpt_list:
+                idx += 1
+                label = f"{ds}/{peft}_{ckpt}"
+                print(f"\n>>> [{idx}/{total}] {label}")
                 try:
-                    train_one_run(dataset, batch_size, peft_method, args, device, base_outdir)
+                    train_single_run(args, dataset=ds, peft_method=peft, ckpt_mode=ckpt)
+                    completed.append(label)
                 except Exception as e:
-                    print(f"\n[ERROR] Run failed: {e}")
+                    print(f"\n[ERROR] '{label}' failed: {e}")
                     traceback.print_exc()
-                    print("[SKIP] Continuing to next configuration...\n")
+                    failed.append(label)
                 torch.cuda.empty_cache()
+
+    print(f"\n{'='*80}\nEXPERIMENT SUMMARY\n{'='*80}")
+    print(f"Completed: {len(completed)}/{total}")
+    for c in completed: print(f"  + {c}")
+    if failed:
+        print(f"Failed: {len(failed)}/{total}")
+        for f in failed: print(f"  x {f}")
+
 
 
 if __name__ == "__main__":
     main()
+

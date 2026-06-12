@@ -53,7 +53,7 @@ NUM_WORKERS = 2  # Kaggle обычно стабильно на 2-4
 MODEL_NAME = "vit_small_patch16_224"
 SEED = 42
 MEMORY_CAPACITY_GB = 2.0
-DEFAULT_OUTDIR = Path('./texture_results')
+DEFAULT_OUTDIR = Path('./vit_s_results')
 DEFAULT_DATA_ROOT = Path('./data')
 GPU_INDEX = 0
 
@@ -288,9 +288,14 @@ def build_model(num_classes: int, ckpt: bool, peft_method: str, args):
     base = get_base_model_from_peft(model)
     assert hasattr(base, "blocks"), "Could not find .blocks in model"
 
-    if ckpt and peft_method != "qlora" and hasattr(base, "set_grad_checkpointing"):
-        base.set_grad_checkpointing(enable=True)
-        print("Static checkpoint enabled (native)")
+    if ckpt:
+        if peft_method == "qlora":
+            # bitsandbytes Linear4bit is incompatible with timm's set_grad_checkpointing.
+            # Use manual torch.utils.checkpoint patching instead (called after model.to(device)).
+            pass  # inject_static_checkpointing() called in train_single_run after .to(device)
+        elif hasattr(base, "set_grad_checkpointing"):
+            base.set_grad_checkpointing(enable=True)
+            print(f"Static checkpoint enabled (native) [peft={peft_method}]")
 
     return model
 
@@ -624,6 +629,26 @@ def attach_mem_hooks(model: nn.Module, memlog: MemLogger, epoch_ref, step_ref):
     return handles
 
 
+def inject_static_checkpointing(model: nn.Module):
+    """
+    Monkey-patch every transformer block to use torch.utils.checkpoint.
+    Used for QLoRA where timm's set_grad_checkpointing is incompatible
+    with bitsandbytes Linear4bit layers.
+    """
+    for block in model.blocks:
+        orig_forward = block.forward
+
+        def make_forward(orig_fwd):
+            def forward(x):
+                if not torch.is_grad_enabled():
+                    return orig_fwd(x)
+                return checkpoint(orig_fwd, x, use_reentrant=False)
+            return forward
+
+        block.forward = make_forward(orig_forward)
+    print(f"[QLoRA] Static checkpointing injected via torch.utils.checkpoint on {len(model.blocks)} blocks")
+
+
 def inject_dynamic_checkpointing(model: nn.Module, device: torch.device, mem_cap_bytes: int, step_ref, memlog: MemLogger, epoch_ref, pwr: GpuPowerMeter = None, threshold_ratio: float = 0.8):
     for layer_idx, block in enumerate(model.blocks, start=1):
         orig_forward = block.forward
@@ -694,7 +719,7 @@ def parse_args():
     ap.add_argument("--batch-size", type=int, default=BATCH_SIZE)
     ap.add_argument("--num-workers", type=int, default=NUM_WORKERS)
     ap.add_argument("--lr", type=float, default=5e-4, help="Learning rate for PEFT methods")
-    ap.add_argument("--lr-fullft", type=float, default=1e-4, help="Learning rate for full fine-tuning (peft=none)")
+    ap.add_argument("--lr-fullft", type=float, default=1e-5, help="Learning rate for full fine-tuning (peft=none)")
     ap.add_argument("--weight-decay", type=float, default=0.05)
     ap.add_argument("--log-interval", type=int, default=200)
     ap.add_argument("--eval-batch-size", type=int, default=64, help="Batch size for evaluation")
@@ -794,6 +819,12 @@ def train_single_run(args, dataset: str, peft_method: str, ckpt_mode: str):
     # --- Model ---
     use_static_ckpt = (ckpt_mode == "static")
     model = build_model(num_classes, ckpt=use_static_ckpt, peft_method=peft_method, args=args).to(device)
+
+    # QLoRA static checkpointing must be applied after .to(device) because
+    # bitsandbytes Linear4bit finalizes quantization on the first CUDA call.
+    if use_static_ckpt and peft_method == "qlora":
+        base_for_ckpt = get_base_model_from_peft(model)
+        inject_static_checkpointing(base_for_ckpt)
 
     # --- LR: lower for full fine-tuning ---
     lr = args.lr_fullft if peft_method == "none" else args.lr

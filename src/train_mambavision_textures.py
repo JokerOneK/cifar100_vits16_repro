@@ -1,4 +1,5 @@
 import os
+import shutil
 
 # Kaggle-friendly dirs
 KAGGLE_WORKING = "/kaggle/working"
@@ -16,6 +17,7 @@ from pathlib import Path
 from typing import List, Dict, Tuple
 from datetime import datetime
 import copy
+import traceback
 
 from torch.utils.checkpoint import checkpoint
 
@@ -29,6 +31,7 @@ from tqdm import tqdm
 # --- PEFT / bitsandbytes ---
 try:
     from peft import get_peft_model, LoraConfig, AdaLoraConfig, prepare_model_for_kbit_training
+
     PEFT_AVAILABLE = True
 except ImportError:
     PEFT_AVAILABLE = False
@@ -36,6 +39,7 @@ except ImportError:
 
 try:
     import bitsandbytes as bnb
+
     BNB_AVAILABLE = True
 except ImportError:
     BNB_AVAILABLE = False
@@ -43,6 +47,7 @@ except ImportError:
 # --- MambaVision ---
 try:
     from mambavision import create_model as create_mambavision_model
+
     MAMBAVISION_AVAILABLE = True
 except ImportError:
     MAMBAVISION_AVAILABLE = False
@@ -95,7 +100,7 @@ MODEL_CONFIGS = {
 # -------------------------------
 EPOCHS = 10
 STEPS_PER_EPOCH = 782
-BATCH_SIZE = 32
+BATCH_SIZE = 16
 NUM_WORKERS = 2
 DEFAULT_MODEL = "mamba_vision_T"
 SEED = 42
@@ -134,7 +139,8 @@ def ensure_cuda():
 # -------------------------------
 # DTD Dataloaders
 # -------------------------------
-def make_dataloaders_dtd(steps_per_epoch: int, batch_size: int, num_workers: int, data_root: str, download: bool, eval_batch_size: int = 64):
+def make_dataloaders_dtd(steps_per_epoch: int, batch_size: int, num_workers: int, data_root: str, download: bool,
+                         eval_batch_size: int = 64):
     """
     DTD (Describable Textures Dataset)
     split: train/val/test
@@ -142,7 +148,7 @@ def make_dataloaders_dtd(steps_per_epoch: int, batch_size: int, num_workers: int
     """
     img_size = 224
     mean = (0.485, 0.456, 0.406)
-    std  = (0.229, 0.224, 0.225)
+    std = (0.229, 0.224, 0.225)
 
     train_tf = transforms.Compose([
         transforms.RandomResizedCrop(img_size, scale=(0.8, 1.0)),
@@ -162,8 +168,8 @@ def make_dataloaders_dtd(steps_per_epoch: int, batch_size: int, num_workers: int
 
     # DTD: 47 классов
     dtd_train = datasets.DTD(root=str(root), split="train", transform=train_tf, download=download)
-    dtd_val   = datasets.DTD(root=str(root), split="val",   transform=train_tf, download=download)
-    dtd_test  = datasets.DTD(root=str(root), split="test",  transform=test_tf,  download=download)
+    dtd_val = datasets.DTD(root=str(root), split="val", transform=train_tf, download=download)
+    dtd_test = datasets.DTD(root=str(root), split="test", transform=test_tf, download=download)
 
     num_classes = len(dtd_train.classes)
 
@@ -193,11 +199,11 @@ def make_dataloaders_dtd(steps_per_epoch: int, batch_size: int, num_workers: int
     return train_loader, test_loader, num_classes
 
 
-
 # -------------------------------
 # CIFAR-100 Dataloaders
 # -------------------------------
-def make_dataloaders_cifar100(steps_per_epoch: int, batch_size: int, num_workers: int, data_root: str, download: bool, eval_batch_size: int = 64):
+def make_dataloaders_cifar100(steps_per_epoch: int, batch_size: int, num_workers: int, data_root: str, download: bool,
+                              eval_batch_size: int = 64):
     """
     CIFAR-100
     split: train/test
@@ -205,7 +211,7 @@ def make_dataloaders_cifar100(steps_per_epoch: int, batch_size: int, num_workers
     img_size = 224
     # ImageNet normalization for pretrained models
     mean = (0.485, 0.456, 0.406)
-    std  = (0.229, 0.224, 0.225)
+    std = (0.229, 0.224, 0.225)
 
     train_tf = transforms.Compose([
         transforms.Resize((img_size, img_size)),
@@ -301,7 +307,7 @@ def get_mamba_blocks(model) -> list:
     base = get_base_model_from_peft(model)
     blocks = []
     seen_ids = set()
-    
+
     # Remove debug prints
 
     def add_block(b):
@@ -329,20 +335,20 @@ def get_mamba_blocks(model) -> list:
     # 1. MambaVision структура: levels -> blocks
     if hasattr(inner_model, 'levels'):
         for level_idx, level in enumerate(inner_model.levels):
-            if level_idx < 2: continue # Skip conv stages
+            if level_idx < 2: continue  # Skip conv stages
             check_and_add(level)
-    
+
     # 2. Timm style: stages -> blocks
     elif hasattr(inner_model, 'stages'):
         for stage_idx, stage in enumerate(inner_model.stages):
             if stage_idx < 2: continue
             check_and_add(stage)
-            
+
     # 3. Flat blocks
     elif hasattr(inner_model, 'blocks'):
         for b in inner_model.blocks:
             add_block(b)
-            
+
     # 4. Layers (generic)
     elif hasattr(inner_model, 'layers'):
         for i, layer in enumerate(inner_model.layers):
@@ -393,9 +399,8 @@ def get_all_blocks_for_hooks(model) -> list:
     elif hasattr(inner_model, 'layers'):
         for layer in inner_model.layers:
             check_and_add(layer)
-    
-    return blocks
 
+    return blocks
 
 
 # -------------------------------
@@ -406,14 +411,14 @@ def build_model(num_classes: int, ckpt: bool, peft_method: str, args):
     model_name = model_cfg["name"]
 
     print(f"Building model: {model_name} | Mode: {peft_method}")
-    
+
     # Загрузка MambaVision модели
     # Приоритет: HuggingFace (не требует компиляции CUDA) -> mambavision pip
     try:
         from transformers import AutoModelForImageClassification
         print(f"[Loading] MambaVision from HuggingFace: {model_cfg['hf_name']}")
         model = AutoModelForImageClassification.from_pretrained(
-            model_cfg["hf_name"], 
+            model_cfg["hf_name"],
             trust_remote_code=True,
             num_labels=num_classes,
             ignore_mismatched_sizes=True
@@ -425,7 +430,8 @@ def build_model(num_classes: int, ckpt: bool, peft_method: str, args):
             model = create_mambavision_model(model_name, pretrained=True)
             # Заменяем head для нужного числа классов
             if hasattr(model, 'head'):
-                in_features = model.head.in_features if hasattr(model.head, 'in_features') else model.head.fc.in_features
+                in_features = model.head.in_features if hasattr(model.head,
+                                                                'in_features') else model.head.fc.in_features
                 model.head = nn.Linear(in_features, num_classes)
             elif hasattr(model, 'classifier'):
                 in_features = model.classifier.in_features
@@ -503,11 +509,16 @@ def build_model(num_classes: int, ckpt: bool, peft_method: str, args):
         model = get_peft_model(model, config)
         model.print_trainable_parameters()
 
+    # Static checkpointing — inject via block-level patching (HF MambaVision does not
+    # implement the HF gradient_checkpointing API, so we use the same approach as adaptive)
+    if ckpt:
+        inject_static_checkpointing(model)
+
     # Проверяем что можем получить блоки
     blocks = get_mamba_blocks(model)
     n_blocks = len(blocks)
     print(f"Found {n_blocks} Mamba/Transformer blocks for checkpointing")
-    
+
     all_blocks = get_all_blocks_for_hooks(model)
     print(f"Total blocks for memory hooks: {len(all_blocks)}")
 
@@ -528,7 +539,8 @@ class GpuPowerMeter:
         self._step_file = gzip.open(step_energy_path, "at", newline="")
         self._step_writer = csv.writer(self._step_file)
         if step_energy_path.stat().st_size == 0:
-            self._step_writer.writerow(["ts","epoch","step","phase","step_ms","p_start_w","p_end_w","p_avg_w","energy_j"])
+            self._step_writer.writerow(
+                ["ts", "epoch", "step", "phase", "step_ms", "p_start_w", "p_end_w", "p_avg_w", "energy_j"])
 
     def _init_nvml(self):
         try:
@@ -599,7 +611,8 @@ class GpuPowerMeter:
     def epoch_totals(self):
         total_e = (self.train_energy_j if not math.isnan(self.train_energy_j) else 0.0) + \
                   (self.eval_energy_j if not math.isnan(self.eval_energy_j) else 0.0)
-        total_e = total_e if (not math.isnan(self.train_energy_j) or not math.isnan(self.eval_energy_j)) else float("nan")
+        total_e = total_e if (not math.isnan(self.train_energy_j) or not math.isnan(self.eval_energy_j)) else float(
+            "nan")
         total_t = self.train_time_s + self.eval_time_s
         avg_power = (total_e / total_t) if (not math.isnan(total_e) and total_t > 0) else float("nan")
         return dict(
@@ -613,7 +626,8 @@ class GpuPowerMeter:
 # Memory Logger (per-run files)
 # -------------------------------
 class MemLogger:
-    def __init__(self, device, n_layers: int, raw_log_gz: Path, epoch_avg_csv: Path, layer_times_gz: Path, layer_time_epoch_avg_csv: Path):
+    def __init__(self, device, n_layers: int, raw_log_gz: Path, epoch_avg_csv: Path, layer_times_gz: Path,
+                 layer_time_epoch_avg_csv: Path):
         self.device = device
         self.n_layers = n_layers
 
@@ -625,23 +639,23 @@ class MemLogger:
         self.raw_file = gzip.open(self.raw_path, "at", newline="")
         self.raw_writer = csv.writer(self.raw_file)
         if self.raw_path.stat().st_size == 0:
-            self.raw_writer.writerow(["epoch","step","phase","layer","mem_mib"])
+            self.raw_writer.writerow(["epoch", "step", "phase", "layer", "mem_mib"])
         self.epoch_acc: Dict[Tuple[str, int], Tuple[float, int]] = {}
 
         self.time_file = gzip.open(self.layer_times_path, "at", newline="")
 
         self.time_writer = csv.writer(self.time_file)
         if self.layer_times_path.stat().st_size == 0:
-            self.time_writer.writerow(["ts","epoch","step","phase","layer","ms"])
+            self.time_writer.writerow(["ts", "epoch", "step", "phase", "layer", "ms"])
         self.epoch_time_acc: Dict[Tuple[str, int], Tuple[float, int]] = {}
-        
+
         # Buffer for deferred timing
-        self.pending_events = [] 
+        self.pending_events = []
 
         first = (not self.layer_time_epoch_avg_path.exists()) or (self.layer_time_epoch_avg_path.stat().st_size == 0)
         if first:
             with open(self.layer_time_epoch_avg_path, "a", newline="") as f:
-                csv.writer(f).writerow(["epoch","x_label","phase","layer","avg_ms"])
+                csv.writer(f).writerow(["epoch", "x_label", "phase", "layer", "avg_ms"])
 
     @torch.no_grad()
     def log_now(self, epoch: int, step: int, phase: str, layer_idx: int):
@@ -659,17 +673,17 @@ class MemLogger:
         """Sync and log all buffered timings"""
         if not self.pending_events:
             return
-        
+
         # Sync once for all pending events
         torch.cuda.synchronize()
-        
+
         for epoch, step, phase, layer_idx, start, end in self.pending_events:
             ms = start.elapsed_time(end)
             self.time_writer.writerow([iso_now(), epoch, step, phase, layer_idx, f"{ms:.3f}"])
             key = (phase, layer_idx)
             total, cnt = self.epoch_time_acc.get(key, (0.0, 0))
             self.epoch_time_acc[key] = (total + ms, cnt + 1)
-        
+
         self.pending_events.clear()
 
     def reset_epoch_acc(self):
@@ -680,12 +694,12 @@ class MemLogger:
     def flush_epoch_avg(self, epoch: int):
         # Ensure everything is processed
         self.process_buffered_events()
-        
+
         first_write = (not self.epoch_avg_path.exists()) or (self.epoch_avg_path.stat().st_size == 0)
         with open(self.epoch_avg_path, "a", newline="") as f:
             w = csv.writer(f)
             if first_write:
-                w.writerow(["epoch","x_label","phase","layer","mem_mib"])
+                w.writerow(["epoch", "x_label", "phase", "layer", "mem_mib"])
             for i in range(1, self.n_layers + 1):
                 total, cnt = self.epoch_acc.get(("fwd", i), (0.0, 1))
                 w.writerow([epoch, f"fwd-L{i}", "fwd", i, f"{(total / cnt):.3f}"])
@@ -705,18 +719,24 @@ class MemLogger:
                     w.writerow([epoch, f"bwd-L{i}", "bwd", i, f"{(tot / cnt):.3f}"])
 
     def close(self):
-        try: self.raw_file.close()
-        except Exception: pass
-        try: self.time_file.close()
-        except Exception: pass
+        try:
+            self.raw_file.close()
+        except Exception:
+            pass
+        try:
+            self.time_file.close()
+        except Exception:
+            pass
 
 
 class SmoothedValue:
     def __init__(self, momentum=0.98):
         self.m = None
         self.beta = momentum
+
     def update(self, x):
         self.m = x if self.m is None else self.beta * self.m + (1 - self.beta) * x
+
     @property
     def value(self):
         return float(self.m) if self.m is not None else float("nan")
@@ -746,7 +766,8 @@ def ensure_metrics_csv_header(ab_values: List[int], metrics_path: Path):
     if first:
         with open(metrics_path, "a", newline="") as f:
             w = csv.writer(f)
-            header = ["epoch","train_time_s","eval_time_s","total_time_s","train_energy_j","eval_energy_j","total_energy_j","avg_power_w","test_acc_pct"]
+            header = ["epoch", "train_time_s", "eval_time_s", "total_time_s", "train_energy_j", "eval_energy_j",
+                      "total_energy_j", "avg_power_w", "test_acc_pct"]
             for a in ab_values:
                 header.append(f"SAM_a{a}_b{a}")
             w.writerow(header)
@@ -776,7 +797,7 @@ def run_eval(model, loader, device, pwr: GpuPowerMeter, epoch_idx=-1):
                 logits = out[0]
             else:
                 logits = out
-            
+
             loss = criterion(logits, y)
 
             pred = logits.argmax(dim=1)
@@ -807,6 +828,7 @@ def attach_mem_hooks(model: nn.Module, memlog: MemLogger, epoch_ref, step_ref):
             ev = torch.cuda.Event(enable_timing=True)
             ev.record(torch.cuda.current_stream())
             fwd_start_events[layer_idx] = ev
+
         return _hook
 
     def make_fwd_end(layer_idx):
@@ -817,6 +839,7 @@ def attach_mem_hooks(model: nn.Module, memlog: MemLogger, epoch_ref, step_ref):
             start = fwd_start_events.pop(layer_idx, None)
             if start is not None:
                 memlog.buffer_layer_time(epoch_ref(), step_ref(), "fwd", layer_idx, start, end)
+
         return _hook
 
     have_bwd_pre = hasattr(nn.Module, "register_full_backward_pre_hook")
@@ -826,6 +849,7 @@ def attach_mem_hooks(model: nn.Module, memlog: MemLogger, epoch_ref, step_ref):
             ev = torch.cuda.Event(enable_timing=True)
             ev.record(torch.cuda.current_stream())
             bwd_start_events[layer_idx] = ev
+
         return _hook
 
     def make_bwd_end(layer_idx):
@@ -836,9 +860,10 @@ def attach_mem_hooks(model: nn.Module, memlog: MemLogger, epoch_ref, step_ref):
             start = bwd_start_events.pop(layer_idx, None)
             # ms = start.elapsed_time(end) if start is not None else 0.0
             if start is not None:
-                 memlog.buffer_layer_time(epoch_ref(), step_ref(), "bwd", layer_idx, start, end)
-            
+                memlog.buffer_layer_time(epoch_ref(), step_ref(), "bwd", layer_idx, start, end)
+
             memlog.log_now(epoch_ref(), step_ref(), "bwd", layer_idx)
+
         return _hook
 
     # Получаем все блоки для хуков
@@ -854,16 +879,14 @@ def attach_mem_hooks(model: nn.Module, memlog: MemLogger, epoch_ref, step_ref):
     return handles
 
 
-def inject_dynamic_checkpointing(model: nn.Module, device: torch.device, mem_cap_bytes: int, step_ref, memlog: MemLogger, epoch_ref, pwr: GpuPowerMeter = None, threshold_ratio: float = 0.65):
+def inject_dynamic_checkpointing(model: nn.Module, device: torch.device, mem_cap_bytes: int, step_ref,
+                                 memlog: MemLogger, epoch_ref, pwr: GpuPowerMeter = None,
+                                 threshold_ratio: float = 0.50):
     """
     Inject adaptive gradient checkpointing into Mamba/Transformer blocks.
-    
-    MambaVision особенности:
-    - Более плоский профиль памяти благодаря SSM (O(1))
-    - threshold_ratio=0.65 рекомендуется (выше чем для ViT)
     """
     blocks = get_mamba_blocks(model)
-    
+
     if len(blocks) == 0:
         print("[WARNING] No blocks found for dynamic checkpointing!")
         return
@@ -881,10 +904,10 @@ def inject_dynamic_checkpointing(model: nn.Module, device: torch.device, mem_cap
                     x = args[0]
                 else:
                     x = kwargs.get('hidden_states', kwargs.get('x', None))
-                
+
                 if x is None:
                     return orig_fwd(*args, **kwargs)
-                
+
                 if not torch.is_grad_enabled():
                     return orig_fwd(*args, **kwargs)
 
@@ -925,7 +948,7 @@ def inject_dynamic_checkpointing(model: nn.Module, device: torch.device, mem_cap
                         b._in_recompute = was_flag
 
                     end_ev.record(torch.cuda.current_stream())
-                    # end_ev.synchronize() <-- removed 
+                    # end_ev.synchronize() <-- removed
                     # ms = start_ev.elapsed_time(end_ev)
                     memlog.buffer_layer_time(epoch_ref(), step_ref(), "fwd_re", layer_idx, start_ev, end_ev)
 
@@ -937,21 +960,60 @@ def inject_dynamic_checkpointing(model: nn.Module, device: torch.device, mem_cap
                     return out
 
                 return checkpoint(run_block, x, use_reentrant=False)
+
             return forward
 
         block.forward = make_forward(block, orig_forward, layer_idx)
-    
+
     print(f"[Dynamic Checkpointing] Injected into {len(blocks)} blocks with threshold_ratio={threshold_ratio}")
+
+
+def inject_static_checkpointing(model: nn.Module):
+    """
+    Inject static gradient checkpointing into all Mamba/Transformer blocks.
+    Works for any model regardless of HF support by patching block.forward directly.
+    """
+    blocks = get_mamba_blocks(model)
+
+    if len(blocks) == 0:
+        print("[WARNING] No blocks found for static checkpointing!")
+        return
+
+    for block in blocks:
+        orig_forward = block.forward
+
+        def make_forward(orig_fwd):
+            def forward(*args, **kwargs):
+                if not torch.is_grad_enabled():
+                    return orig_fwd(*args, **kwargs)
+
+                if args:
+                    x = args[0]
+                else:
+                    x = kwargs.get('hidden_states', kwargs.get('x', None))
+
+                if x is None:
+                    return orig_fwd(*args, **kwargs)
+
+                def run_block(inp):
+                    if args:
+                        return orig_fwd(inp, *args[1:], **kwargs)
+                    else:
+                        return orig_fwd(inp, **{k: v for k, v in kwargs.items() if k not in ('hidden_states', 'x')})
+
+                return checkpoint(run_block, x, use_reentrant=False)
+
+            return forward
+
+        block.forward = make_forward(orig_forward)
+
+    print(f"[Static Checkpointing] Injected into {len(blocks)} blocks via torch.utils.checkpoint")
 
 
 def parse_args():
     ap = argparse.ArgumentParser(
-        description="Train MambaVision on DTD or CIFAR-100 with PEFT methods and adaptive checkpointing"
+        description="Train MambaVision on DTD/CIFAR-100 with PEFT methods and adaptive checkpointing"
     )
-
-    # Dataset selection
-    ap.add_argument("--dataset", type=str, default="dtd", choices=["dtd", "cifar100"],
-                    help="Dataset choices: 'dtd' (default) or 'cifar100'")
 
     # Model selection
     ap.add_argument("--model", type=str, default=DEFAULT_MODEL,
@@ -965,7 +1027,9 @@ def parse_args():
     ap.add_argument("--eval-batch-size", type=int, default=64,
                     help="Batch size for evaluation (reduce for low memory)")
     ap.add_argument("--num-workers", type=int, default=NUM_WORKERS)
-    ap.add_argument("--lr", type=float, default=5e-4)
+    ap.add_argument("--lr", type=float, default=5e-4, help="Learning rate for PEFT methods")
+    ap.add_argument("--lr-fullft", type=float, default=1e-5,
+                    help="Learning rate for full fine-tuning (peft=none)")
     ap.add_argument("--weight-decay", type=float, default=0.05)
     ap.add_argument("--log-interval", type=int, default=200)
     ap.add_argument("--no-progress", action="store_true")
@@ -973,17 +1037,23 @@ def parse_args():
     ap.add_argument("--gpu-index", type=int, default=GPU_INDEX)
 
     ap.add_argument("--sam-ab", type=str, default="1,2,3,4,5")
-    ap.add_argument("--ckpt-mode", type=str, default="adaptive", choices=["none","static","adaptive"])
-    ap.add_argument("--threshold-ratio", type=float, default=0.65,
+
+    # --- Multi-experiment matrix ---
+    ap.add_argument("--datasets", type=str, nargs="+", default=["cifar100", "dtd"],
+                    choices=["cifar100", "dtd"], help="Datasets to run")
+    ap.add_argument("--ckpt-modes", type=str, nargs="+", default=["none", "static", "adaptive"],
+                    choices=["none", "static", "adaptive"], help="Checkpointing modes")
+    ap.add_argument("--peft-methods", type=str, nargs="+",
+                    default=["none", "bitfit", "lora", "adalora", "qlora"],
+                    choices=["none", "lora", "qlora", "adalora", "bitfit"],
+                    help="PEFT methods to run")
+
+    ap.add_argument("--threshold-ratio", type=float, default=0.50,
                     help="Memory threshold ratio for adaptive checkpointing (0.0-1.0)")
 
     ap.add_argument("--outdir", type=str, default=str(DEFAULT_OUTDIR))
     ap.add_argument("--data-root", type=str, default=str(DEFAULT_DATA_ROOT))
-    ap.add_argument("--download", action="store_true", help="Download DTD dataset (needs Kaggle Internet=On)")
-
-    # PEFT method
-    ap.add_argument("--peft-method", type=str, default="none",
-                    choices=["none","lora","qlora","adalora","bitfit","all"])
+    ap.add_argument("--download", action="store_true", help="Download datasets if needed")
 
     # LoRA params
     ap.add_argument("--lora-r", type=int, default=8)
@@ -1002,32 +1072,39 @@ def parse_args():
     return ap.parse_args()
 
 
-def train(args):
+def train_single_run(args, dataset: str, peft_method: str, ckpt_mode: str):
+    """
+    Train a single experiment configuration.
+    Called from main() for each (dataset, peft_method, ckpt_mode) combination.
+    """
+    run_tag = f"{args.model}/{dataset}/{peft_method}_{ckpt_mode}"
+    print(f"\n{'=' * 80}")
+    print(f"STARTING: {run_tag}")
+    print(f"{'=' * 80}")
     set_seed(SEED)
     device = ensure_cuda()
 
     model_cfg = MODEL_CONFIGS[args.model]
-    print(f"\n{'='*60}")
-    print(f"Model: {args.model} ({model_cfg['name']})")
-    print(f"Expected params: ~{model_cfg['params_m']:.1f}M")
-    print(f"{'='*60}\n")
+    print(f"Model: {args.model} | Expected params: ~{model_cfg['params_m']:.1f}M")
 
-    # ---- GPU memory cap ----
+    # ---- GPU memory cap (only for adaptive checkpointing) ----
     total_bytes = torch.cuda.get_device_properties(args.gpu_index).total_memory
-    cap_bytes = int(max(0.1, MEMORY_CAPACITY_GB) * (1024**3))
+    cap_bytes = int(max(0.1, MEMORY_CAPACITY_GB) * (1024 ** 3))
     try:
-        frac = min(0.99, cap_bytes / total_bytes)
-        torch.cuda.set_per_process_memory_fraction(frac, device=args.gpu_index)
-        print(f"[GPU MEM CAP] Limiting allocator to ~{MEMORY_CAPACITY_GB:.2f} GB ({frac*100:.1f}%).")
+        if ckpt_mode == "adaptive" or ckpt_mode == "static":
+            frac = min(0.99, cap_bytes / total_bytes)
+            torch.cuda.set_per_process_memory_fraction(frac, device=args.gpu_index)
+            print(f"[GPU MEM CAP] Limiting allocator to ~{MEMORY_CAPACITY_GB:.2f} GB ({frac * 100:.1f}%) for adaptive checkpointing.")
+        else:
+            torch.cuda.set_per_process_memory_fraction(0.99, device=args.gpu_index)
+            print(f"[GPU MEM] No cap — using full GPU memory (ckpt_mode={ckpt_mode}).")
     except Exception:
         pass
 
     ab_vals = sorted(set(int(s) for s in args.sam_ab.split(",") if s.strip()))
 
     outdir_base = Path(args.outdir)
-    outdir_base.mkdir(parents=True, exist_ok=True)
-    run_name = f"{args.model}_{args.peft_method}_{args.ckpt_mode}"
-    run_dir = outdir_base / run_name
+    run_dir = outdir_base / args.model / dataset / f"{peft_method}_{ckpt_mode}"
     run_dir.mkdir(parents=True, exist_ok=True)
     print(f"[RUN DIR] {run_dir}")
 
@@ -1038,42 +1115,66 @@ def train(args):
     step_energy_gz = run_dir / "step_energy.csv.gz"
     metrics_csv_path = run_dir / "epoch_metrics.csv"
 
+    # --- Skip / Reset logic ---
+    if metrics_csv_path.exists():
+        try:
+            with open(metrics_csv_path, newline="", encoding="utf-8") as _f:
+                _train_rows = [r for r in csv.DictReader(_f) if r.get("epoch", "0") != "0"]
+            if _train_rows:
+                print(f"[SKIP] {run_tag}: already has {len(_train_rows)} completed epoch(s). Skipping.")
+                return
+            else:
+                print(f"[RESET] {run_tag}: epoch_metrics.csv exists but has no training epochs — cleaning run_dir and rerunning.")
+                shutil.rmtree(run_dir, ignore_errors=True)
+                run_dir.mkdir(parents=True, exist_ok=True)
+        except Exception as _e:
+            print(f"[RESET] {run_tag}: could not read epoch_metrics.csv ({_e}) — cleaning run_dir and rerunning.")
+            shutil.rmtree(run_dir, ignore_errors=True)
+            run_dir.mkdir(parents=True, exist_ok=True)
+
     ensure_metrics_csv_header(ab_vals, metrics_csv_path)
 
-
-    if args.dataset == "cifar100":
-        loader_fn = make_dataloaders_cifar100
+    # --- Dataset ---
+    if dataset == "cifar100":
+        train_loader, test_loader, num_classes = make_dataloaders_cifar100(
+            args.steps_per_epoch, args.batch_size, args.num_workers,
+            data_root=args.data_root, download=args.download,
+            eval_batch_size=args.eval_batch_size,
+        )
+        print(f"[CIFAR-100] num_classes={num_classes}")
     else:
-        loader_fn = make_dataloaders_dtd
+        train_loader, test_loader, num_classes = make_dataloaders_dtd(
+            args.steps_per_epoch, args.batch_size, args.num_workers,
+            data_root=args.data_root, download=args.download,
+            eval_batch_size=args.eval_batch_size,
+        )
+        print(f"[DTD] num_classes={num_classes}")
 
-    train_loader, test_loader, num_classes = loader_fn(
-        args.steps_per_epoch, args.batch_size, args.num_workers,
-        data_root=args.data_root,
-        download=args.download,
-        eval_batch_size=args.eval_batch_size,
-    )
-    print(f"[{args.dataset.upper()}] num_classes={num_classes}")
+    # --- Model ---
+    use_static_ckpt = (ckpt_mode == "static")
+    model = build_model(num_classes, ckpt=use_static_ckpt, peft_method=peft_method, args=args).to(device)
 
-    use_static_ckpt = (args.ckpt_mode == "static")
-    model = build_model(num_classes, ckpt=use_static_ckpt, peft_method=args.peft_method, args=args).to(device)
+    # --- LR: lower for full fine-tuning ---
+    lr = args.lr_fullft if peft_method == "none" else args.lr
+    print(f"[LR] {lr:.1e} ({'FullFT' if peft_method == 'none' else peft_method})")
 
     trainable_params = [p for p in model.parameters() if p.requires_grad]
-    optimizer = torch.optim.AdamW(trainable_params, lr=args.lr, weight_decay=args.weight_decay)
+    optimizer = torch.optim.AdamW(trainable_params, lr=lr, weight_decay=args.weight_decay)
     criterion = nn.CrossEntropyLoss()
     scaler = torch.cuda.amp.GradScaler(enabled=args.amp)
 
     cur_epoch = {"v": 0}
     cur_step = {"v": 0}
+    global_step = {"v": 0}
     epoch_ref = lambda: cur_epoch["v"]
     step_ref = lambda: cur_step["v"]
 
-    base_model_for_hooks = get_base_model_from_peft(model)
     all_blocks = get_all_blocks_for_hooks(model)
     n_blocks = len(all_blocks)
     memlog = MemLogger(device, n_blocks, raw_log_gz, epoch_avg_csv, layer_times_gz, layer_time_epoch_avg_csv)
     pwr = GpuPowerMeter(device_index=args.gpu_index, step_energy_path=step_energy_gz)
 
-    if args.ckpt_mode == "adaptive":
+    if ckpt_mode == "adaptive":
         inject_dynamic_checkpointing(
             model, device=device, mem_cap_bytes=cap_bytes,
             step_ref=step_ref, memlog=memlog, epoch_ref=epoch_ref,
@@ -1120,7 +1221,6 @@ def train(args):
                 if args.amp:
                     with torch.cuda.amp.autocast():
                         out = model(x)
-                        # Handle different output formats
                         if isinstance(out, dict):
                             logits = out.get('logits', out.get('out', None))
                         elif isinstance(out, tuple):
@@ -1129,11 +1229,8 @@ def train(args):
                             logits = out
                         loss = criterion(logits, y)
                     scaler.scale(loss).backward()
-                    scaler.step(optimizer)
-                    scaler.update()
                 else:
                     out = model(x)
-                    # Handle different output formats
                     if isinstance(out, dict):
                         logits = out.get('logits', out.get('out', None))
                     elif isinstance(out, tuple):
@@ -1142,7 +1239,18 @@ def train(args):
                         logits = out
                     loss = criterion(logits, y)
                     loss.backward()
+
+                # AdaLoRA: update rank budget after backward, before step
+                if peft_method == "adalora" and hasattr(model, "base_model") and hasattr(model.base_model, "update_and_allocate"):
+                    model.base_model.update_and_allocate(global_step["v"])
+
+                if args.amp:
+                    scaler.step(optimizer)
+                    scaler.update()
+                else:
                     optimizer.step()
+
+                global_step["v"] += 1
 
                 torch.cuda.synchronize()
                 step_t = time.time() - t0
@@ -1150,7 +1258,6 @@ def train(args):
                 pwr.log_step("train", epoch, step, step_t, p_start, p_end)
                 loss_smooth.update(loss.item())
 
-                # Flush timing events for this step
                 memlog.process_buffered_events()
 
                 if step % args.log_interval == 0:
@@ -1170,7 +1277,7 @@ def train(args):
             sam_vals = compute_sam(acc, totals["total_energy_j"], ab_vals)
             peak_epoch = bytes_to_mib(torch.cuda.max_memory_allocated(device))
 
-            print(f"[Epoch {epoch}/{args.epochs}] Acc={acc:.2f}% TrainT={dt_train/60:.1f}m EvalT={dt_eval:.1f}s AvgW={totals['avg_power_w']:.1f} Energy={totals['total_energy_j']:.0f}J PeakMem={peak_epoch:.0f}MiB")
+            print(f"[Epoch {epoch}/{args.epochs}] Acc={acc:.2f}% TrainT={dt_train / 60:.1f}m EvalT={dt_eval:.1f}s AvgW={totals['avg_power_w']:.1f} Energy={totals['total_energy_j']:.0f}J PeakMem={peak_epoch:.0f}MiB")
 
             row = [
                 epoch,
@@ -1198,17 +1305,59 @@ def train(args):
         pwr.close()
         torch.cuda.empty_cache()
 
+    print(f"\n[DONE] {run_tag}")
+
+
+def main():
+    args = parse_args()
+
+    datasets_list = args.datasets
+    peft_list = args.peft_methods
+    ckpt_list = args.ckpt_modes
+
+    total_runs = len(datasets_list) * len(peft_list) * len(ckpt_list)
+    print(f"\n{'#' * 80}")
+    print(f"EXPERIMENT MATRIX: {len(datasets_list)} datasets × {len(peft_list)} PEFT × {len(ckpt_list)} ckpt = {total_runs} runs")
+    print(f"  Model:     {args.model}")
+    print(f"  Datasets:  {datasets_list}")
+    print(f"  PEFT:      {peft_list}")
+    print(f"  Ckpt:      {ckpt_list}")
+    print(f"  LR (PEFT): {args.lr}  |  LR (FullFT): {args.lr_fullft}")
+    print(f"  Outdir:    {args.outdir}")
+    print(f"{'#' * 80}\n")
+
+    completed = 0
+    failed = 0
+    failed_runs = []
+
+    for ds in datasets_list:
+        for peft in peft_list:
+            for ckpt in ckpt_list:
+                run_tag = f"{args.model}/{ds}/{peft}_{ckpt}"
+                run_idx = completed + failed + 1
+                print(f"\n>>> [{run_idx}/{total_runs}] {run_tag}")
+                try:
+                    train_single_run(args, dataset=ds, peft_method=peft, ckpt_mode=ckpt)
+                    completed += 1
+                except Exception as e:
+                    failed += 1
+                    failed_runs.append(run_tag)
+                    print(f"\n[ERROR] Run '{run_tag}' failed: {e}")
+                    traceback.print_exc()
+                    print(f"[SKIP] Continuing to next configuration...\n")
+                    torch.cuda.empty_cache()
+                    continue
+
+    print(f"\n{'#' * 80}")
+    print(f"EXPERIMENT MATRIX COMPLETE")
+    print(f"  Completed: {completed}/{total_runs}")
+    print(f"  Failed:    {failed}/{total_runs}")
+    if failed_runs:
+        print(f"  Failed runs:")
+        for r in failed_runs:
+            print(f"    - {r}")
+    print(f"{'#' * 80}")
+
 
 if __name__ == "__main__":
-    args = parse_args()
-    if args.peft_method == "all":
-        methods = ["lora", "adalora", "qlora", "none"]
-        for m in methods:
-            print("=" * 80)
-            print(f"Training PEFT method: {m}")
-            print("=" * 80)
-            args_run = copy.deepcopy(args)
-            args_run.peft_method = m
-            train(args_run)
-    else:
-        train(args)
+    main()

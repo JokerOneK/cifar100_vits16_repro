@@ -23,7 +23,8 @@ Usage:
 import os
 
 os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "max_split_size_mb:128,garbage_collection_threshold:0.8"
-os.environ["CUDA_LAUNCH_BLOCKING"] = "1"
+# NOTE: CUDA_LAUNCH_BLOCKING=1 was here for debugging — removed (it serialises every
+# kernel and massively inflates wall-time/energy measurements).
 
 import math
 import time
@@ -543,7 +544,59 @@ def ensure_metrics_csv_header(ab_values, metrics_path):
 # ===============================
 # Model loading
 # ===============================
-def build_smolvlm(model_size: str, device):
+def _load_smolvlm_processor(model_id: str):
+    """Load SmolVLM processor with fallbacks for transformers version mismatches."""
+    # Try 1: standard AutoProcessor
+    try:
+        proc = AutoProcessor.from_pretrained(model_id, trust_remote_code=True)
+        if hasattr(proc, "tokenizer"):
+            proc.tokenizer.padding_side = "left"
+        return proc
+    except (ValueError, OSError) as e:
+        print(f"[SmolVLM] AutoProcessor failed ({e}), trying Idefics3Processor...")
+
+    # Try 2: direct Idefics3Processor import (transformers >= 4.45)
+    try:
+        from transformers import Idefics3Processor
+        proc = Idefics3Processor.from_pretrained(model_id)
+        if hasattr(proc, "tokenizer"):
+            proc.tokenizer.padding_side = "left"
+        return proc
+    except (ImportError, OSError) as e:
+        print(f"[SmolVLM] Idefics3Processor failed ({e}), trying local cache...")
+
+    # Try 3: patch cached processor_config.json to remove unrecognized processor_class
+    print(f"[SmolVLM] Trying HF cache patch for {model_id} ...")
+    try:
+        import json
+        cache_model_dir = "models--" + model_id.replace("/", "--")
+        hf_cache = Path.home() / ".cache" / "huggingface" / "hub" / cache_model_dir
+        patched = False
+        for config_file in hf_cache.rglob("processor_config.json"):
+            with open(config_file) as f:
+                cfg = json.load(f)
+            if "processor_class" in cfg:
+                cfg.pop("processor_class")
+                with open(config_file, "w") as f:
+                    json.dump(cfg, f, indent=2)
+                patched = True
+                print(f"[SmolVLM] Patched {config_file}")
+        if patched:
+            proc = AutoProcessor.from_pretrained(model_id, trust_remote_code=True,
+                                                  local_files_only=True)
+            if hasattr(proc, "tokenizer"):
+                proc.tokenizer.padding_side = "left"
+            return proc
+    except Exception as e:
+        print(f"[SmolVLM] Cache patch failed: {e}")
+
+    raise RuntimeError(
+        "Cannot load SmolVLM processor. "
+        "Upgrade transformers: pip install 'transformers>=4.45'"
+    )
+
+
+def build_smolvlm(model_size: str, device, quantize_4bit: bool = False):
     if not TRANSFORMERS_AVAILABLE:
         raise ImportError("transformers required. pip install transformers accelerate")
 
@@ -551,22 +604,238 @@ def build_smolvlm(model_size: str, device):
     model_id = info["id"]
     print(f"[SmolVLM] Loading {model_id} (~{info['params_m']}M params) ...")
 
-    processor = AutoProcessor.from_pretrained(model_id, trust_remote_code=True)
-    # Fix padding warning for decoder-only architecture
-    if hasattr(processor, "tokenizer"):
-        processor.tokenizer.padding_side = "left"
+    processor = _load_smolvlm_processor(model_id)
 
-    model = AutoModelForVision2Seq.from_pretrained(
-        model_id,
-        torch_dtype=torch.float16,
-        trust_remote_code=True,
-    ).to(device)
+    model = None
+    if quantize_4bit:
+        # Optional — SmolVLM is tiny enough that fp16 fits 8 GB easily; 4-bit only
+        # matters for the 2B variant and needs bitsandbytes installed.
+        try:
+            from transformers import BitsAndBytesConfig
+            bnb = BitsAndBytesConfig(
+                load_in_4bit=True, bnb_4bit_quant_type="nf4",
+                bnb_4bit_compute_dtype=torch.float16, bnb_4bit_use_double_quant=True)
+            print("[SmolVLM] Loading in 4-bit NF4 ...")
+            model = AutoModelForVision2Seq.from_pretrained(
+                model_id, quantization_config=bnb, device_map={"": 0},
+                torch_dtype=torch.float16, trust_remote_code=True)
+        except Exception as e:
+            print(f"[SmolVLM] 4-bit load failed ({e}); falling back to fp16.")
+            model = None
 
+    if model is None:
+        model = AutoModelForVision2Seq.from_pretrained(
+            model_id, torch_dtype=torch.float16, trust_remote_code=True,
+        ).to(device)
 
     total_params = sum(p.numel() for p in model.parameters())
     print(f"[SmolVLM] Total params: {total_params / 1e6:.1f}M")
 
     return model, processor
+
+
+# ===============================
+# LoRA helpers
+# ===============================
+class LoRALinear(torch.nn.Module):
+    """Drop-in LoRA wrapper for nn.Linear. Keeps original weight frozen.
+    Trainable params (lora_A, lora_B) live in fp32 for stable backward,
+    while the frozen base linear stays in the model's original dtype (fp16)."""
+    def __init__(self, linear: torch.nn.Linear, r: int = 4, alpha: int = 8, dropout: float = 0.05):
+        super().__init__()
+        self.linear = linear
+        self.linear.weight.requires_grad = False
+        if linear.bias is not None:
+            self.linear.bias.requires_grad = False
+        self.scaling = alpha / r
+        in_f, out_f = linear.in_features, linear.out_features
+        dev = linear.weight.device
+        self.lora_A = torch.nn.Linear(in_f, r, bias=False).to(dtype=torch.float32, device=dev)
+        self.lora_B = torch.nn.Linear(r, out_f, bias=False).to(dtype=torch.float32, device=dev)
+        self.drop   = torch.nn.Dropout(p=dropout)
+        torch.nn.init.kaiming_uniform_(self.lora_A.weight, a=math.sqrt(5))
+        torch.nn.init.zeros_(self.lora_B.weight)
+
+    def forward(self, x):
+        base = self.linear(x)
+        lora = self.lora_B(self.lora_A(self.drop(x.to(torch.float32)))) * self.scaling
+        return base + lora.to(base.dtype)
+
+
+def setup_projector_lora_smolvlm(model, n_lm_layers: int = 6, lora_r: int = 4):
+    """Connector full FT + LoRA r=lora_r on first n_lm_layers of SmolLM2. All else frozen."""
+    for p in model.parameters():
+        p.requires_grad = False
+
+    lm_layers = model.model.text_model.model.layers
+    for i in range(min(n_lm_layers, len(lm_layers))):
+        attn = lm_layers[i].self_attn
+        for proj_name in ("q_proj", "v_proj"):
+            setattr(attn, proj_name,
+                    LoRALinear(getattr(attn, proj_name), r=lora_r, alpha=lora_r * 2))
+
+    # Keep connector in fp16 (model's native dtype) so eval/generate works
+    # without autocast — only LoRA A/B (tiny) live in fp32 for stable backward.
+    for name, p in model.named_parameters():
+        if "connector" in name:
+            p.requires_grad = True
+
+    model.config.use_cache = False
+    if hasattr(model, "gradient_checkpointing_enable"):
+        try:
+            model.gradient_checkpointing_enable(gradient_checkpointing_kwargs={"use_reentrant": False})
+        except TypeError:
+            model.gradient_checkpointing_enable()
+        if hasattr(model, "enable_input_require_grads"):
+            model.enable_input_require_grads()
+        print("[projector_lora] Gradient checkpointing enabled")
+
+    trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
+    total     = sum(p.numel() for p in model.parameters())
+    print(f"[projector_lora] Trainable: {trainable/1e6:.3f}M / {total/1e6:.1f}M "
+          f"({100*trainable/total:.2f}%)")
+    return model
+
+
+# ===============================
+# QLoRA / light-touch LoRA (mirrors PaliGemma / MobileVLM)
+# ===============================
+def _to_rgb(img):
+    if isinstance(img, torch.Tensor):
+        img = transforms.ToPILImage()(img)
+    elif not isinstance(img, Image.Image):
+        img = Image.fromarray(np.array(img))
+    if img.mode != "RGB":
+        img = img.convert("RGB")
+    return img
+
+
+def _get_text_layers(model):
+    """Locate the SmolLM2 decoder layer list across transformers versions."""
+    tm = model.model.text_model
+    if hasattr(tm, "layers"):
+        return tm.layers
+    if hasattr(tm, "model") and hasattr(tm.model, "layers"):
+        return tm.model.layers
+    raise RuntimeError("Cannot locate SmolVLM text-model layers")
+
+
+def setup_qlora_smolvlm(model, r=16, alpha=32, dropout=0.05):
+    """Freeze everything (vision tower + connector + base LM) and wrap LoRA on the
+    SmolLM2 decoder's attention (q/k/v/o) + MLP (gate/up/down) across ALL layers.
+    Manual LoRALinear (not peft) keeps Idefics3's generate() intact. Works whether the
+    base is fp16 or 4-bit (LoRALinear wraps nn.Linear and bnb Linear4bit alike)."""
+    for p in model.parameters():
+        p.requires_grad = False
+
+    layers = _get_text_layers(model)
+    n_wrapped = 0
+    for layer in layers:
+        attn = layer.self_attn
+        for pn in ("q_proj", "k_proj", "v_proj", "o_proj"):
+            if hasattr(attn, pn):
+                setattr(attn, pn, LoRALinear(getattr(attn, pn), r, alpha, dropout))
+                n_wrapped += 1
+        mlp = layer.mlp
+        for pn in ("gate_proj", "up_proj", "down_proj"):
+            if hasattr(mlp, pn):
+                setattr(mlp, pn, LoRALinear(getattr(mlp, pn), r, alpha, dropout))
+                n_wrapped += 1
+
+    model.config.use_cache = False
+    if hasattr(model, "gradient_checkpointing_enable"):
+        try:
+            model.gradient_checkpointing_enable(gradient_checkpointing_kwargs={"use_reentrant": False})
+        except TypeError:
+            model.gradient_checkpointing_enable()
+        if hasattr(model, "enable_input_require_grads"):
+            model.enable_input_require_grads()
+
+    trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
+    total     = sum(p.numel() for p in model.parameters())
+    print(f"[qlora] r={r} alpha={alpha} dropout={dropout} | wrapped {n_wrapped} Linears")
+    print(f"[qlora] Trainable: {trainable/1e6:.3f}M / {total/1e6:.1f}M "
+          f"({100*trainable/total:.2f}%)")
+    return model
+
+
+def _get_lora_state(model):
+    """Best-checkpoint snapshot for early stopping — trainable LoRA params, on CPU."""
+    return {n: p.detach().to("cpu", copy=True)
+            for n, p in model.named_parameters() if p.requires_grad}
+
+
+def _set_lora_state(model, state):
+    with torch.no_grad():
+        for n, p in model.named_parameters():
+            if n in state:
+                p.copy_(state[n].to(p.device))
+
+
+_FT_MAX_IMG = 256  # cap image size before the processor to avoid SmolVLM tiling blow-up
+
+
+def train_step_sft_single(model, processor, image, class_name, prompt_text, device):
+    """One-sample SFT step with correct answer-only masking. The chat template renders
+    the assistant turn at the end, and the prompt (add_generation_prompt) is a true token
+    prefix of the full text, so we mask the first n_prompt tokens and supervise the rest
+    (class name + <end_of_utterance>)."""
+    if max(image.size) > _FT_MAX_IMG:
+        image = image.resize((_FT_MAX_IMG, _FT_MAX_IMG), Image.BILINEAR)
+
+    msgs_full = [
+        {"role": "user", "content": [{"type": "image"}, {"type": "text", "text": prompt_text}]},
+        {"role": "assistant", "content": [{"type": "text", "text": class_name}]},
+    ]
+    msgs_prompt = [
+        {"role": "user", "content": [{"type": "image"}, {"type": "text", "text": prompt_text}]},
+    ]
+    full_text   = processor.apply_chat_template(msgs_full, tokenize=False)
+    prompt_text_ = processor.apply_chat_template(msgs_prompt, tokenize=False,
+                                                 add_generation_prompt=True)
+
+    inputs = processor(text=[full_text], images=[image], return_tensors="pt",
+                       padding=True, truncation=True).to(device)
+    n_prompt = processor(text=[prompt_text_], images=[image], return_tensors="pt",
+                         padding=True, truncation=True)["input_ids"].shape[1]
+
+    labels = inputs["input_ids"].clone()
+    labels[0, :n_prompt] = -100
+
+    outputs = model(**inputs, labels=labels)
+    return outputs.loss
+
+
+@torch.no_grad()
+def quick_val_acc(model, processor, val_base, val_indices, class_names,
+                  prompt_text, device, max_new_tokens=5):
+    """Greedy-generation accuracy on a small held-out subset — early-stopping signal."""
+    was_training = model.training
+    model.eval()
+    correct = 0
+    for i in val_indices:
+        img, label = val_base[i]
+        img = _to_rgb(img)
+        if max(img.size) > _FT_MAX_IMG:
+            img = img.resize((_FT_MAX_IMG, _FT_MAX_IMG), Image.BILINEAR)
+        messages = [{"role": "user", "content": [
+            {"type": "image"}, {"type": "text", "text": prompt_text}]}]
+        text = processor.apply_chat_template(messages, tokenize=False,
+                                             add_generation_prompt=True)
+        inputs = processor(text=[text], images=[img], return_tensors="pt",
+                           padding=True).to(device)
+        with torch.autocast(device_type="cuda", dtype=torch.float16):
+            gen = model.generate(**inputs, max_new_tokens=max_new_tokens,
+                                 do_sample=False, use_cache=False)
+        out = processor.batch_decode(gen[:, inputs["input_ids"].shape[1]:],
+                                     skip_special_tokens=True)[0]
+        pred_idx, _ = match_prediction_to_class(out, class_names)
+        if pred_idx == label:
+            correct += 1
+        torch.cuda.empty_cache()
+    if was_training:
+        model.train()
+    return 100.0 * correct / max(len(val_indices), 1)
 
 
 # ===============================
@@ -655,12 +924,13 @@ def run_eval_generative(model, processor, test_loader, class_names, prompt_text,
             truncation=True,
         ).to(device)
 
-        generated_ids = model.generate(
-            **inputs,
-            max_new_tokens=max_new_tokens,
-            do_sample=False,
-            use_cache=False,
-        )
+        with torch.autocast(device_type="cuda", dtype=torch.float16):
+            generated_ids = model.generate(
+                **inputs,
+                max_new_tokens=max_new_tokens,
+                do_sample=False,
+                use_cache=False,
+            )
 
         # Decode only the generated part
         input_len = inputs["input_ids"].shape[1]
@@ -709,8 +979,9 @@ def run_eval_hierarchical_smolvlm(model, processor, test_ds_base, class_names,
                                              add_generation_prompt=True)
         inputs = processor(text=[text], images=[img_pil],
                            return_tensors="pt", padding=True).to(device)
-        gen_ids = model.generate(**inputs, max_new_tokens=max_new_tokens,
-                                 do_sample=False, use_cache=False)
+        with torch.autocast(device_type="cuda", dtype=torch.float16):
+            gen_ids = model.generate(**inputs, max_new_tokens=max_new_tokens,
+                                     do_sample=False, use_cache=False)
         out = processor.batch_decode(gen_ids[:, inputs["input_ids"].shape[1]:],
                                      skip_special_tokens=True)
         torch.cuda.empty_cache()
@@ -799,49 +1070,212 @@ def train_single_run(args, dataset: str):
     prompt_text = build_classification_prompt(class_names, dataset, args.use_definitions)
 
     # --- Model ---
-    model, processor = build_smolvlm(args.model_size, device)
+    ft_mode = getattr(args, "ft_mode", "full")
+    model, processor = build_smolvlm(
+        args.model_size, device,
+        quantize_4bit=(ft_mode == "qlora" and getattr(args, "load_4bit", False)))
 
     pwr = GpuPowerMeter(device_index=args.gpu_index, step_energy_path=step_energy_gz)
 
     try:
         # --- Zero-shot baseline ---
-        use_hier = args.use_hierarchical and dataset == "cifar100"
-        mode_tag = "HIERARCHICAL" if use_hier else "ZERO-SHOT"
-        print(f">>> {mode_tag} evaluation...")
-        pwr.reset_epoch()
-        if use_hier:
-            # Hierarchical needs per-image access — use base dataset directly
-            from torchvision import datasets as _tv_ds
-            from pathlib import Path as _Path
-            _base_ds = _tv_ds.CIFAR100(root=str(_Path(args.data_root)), train=False,
-                                       transform=None, download=args.download)
-            base_acc, base_time = run_eval_hierarchical_smolvlm(
-                model, processor, _base_ds, class_names, device, pwr, epoch_idx=0)
+        skip_baseline = (getattr(args, "skip_baseline", False)
+                         and ft_mode in ("projector_lora", "qlora"))
+        if not skip_baseline:
+            use_hier = args.use_hierarchical and dataset == "cifar100"
+            mode_tag = "HIERARCHICAL" if use_hier else "ZERO-SHOT"
+            print(f">>> {mode_tag} evaluation...")
+            pwr.reset_epoch()
+            if use_hier:
+                from torchvision import datasets as _tv_ds
+                from pathlib import Path as _Path
+                _base_ds = _tv_ds.CIFAR100(root=str(_Path(args.data_root)), train=False,
+                                           transform=None, download=args.download)
+                base_acc, base_time = run_eval_hierarchical_smolvlm(
+                    model, processor, _base_ds, class_names, device, pwr, epoch_idx=0)
+            else:
+                base_acc, base_time = run_eval_generative(
+                    model, processor, test_loader, class_names, prompt_text,
+                    device, pwr, epoch_idx=0,
+                )
+            print(f"[{mode_tag}] Acc={base_acc:.2f}% Time={base_time:.2f}s")
+
+            with open(metrics_csv_path, "a", newline="") as f:
+                row = [0, 0.0, f"{base_time:.3f}", f"{base_time:.3f}",
+                       0.0, 0.0, 0.0, 0.0, f"{base_acc:.2f}"]
+                for _ in ab_vals:
+                    row.append("nan")
+                csv.writer(f).writerow(row)
         else:
-            base_acc, base_time = run_eval_generative(
+            print(f"[SKIP BASELINE] Skipping zero-shot eval — using existing results.")
+
+        # --- Light-touch QLoRA fine-tuning with early stopping (mirrors PaliGemma/MobileVLM) ---
+        if args.epochs > 0 and ft_mode == "qlora":
+            model = setup_qlora_smolvlm(model, r=args.lora_r, alpha=args.lora_alpha,
+                                        dropout=0.05)
+            trainable_params = [p for p in model.parameters() if p.requires_grad]
+            optimizer = torch.optim.AdamW(trainable_params, lr=args.lr,
+                                          weight_decay=args.weight_decay)
+            print(f"[FT] qlora | epochs={args.epochs} ft_steps={args.ft_steps} "
+                  f"grad_accum={args.grad_accum} lr={args.lr:.1e} "
+                  f"lora_r={args.lora_r} (train prompt == eval prompt)")
+            print(f"[FT] Trainable: {sum(p.numel() for p in trainable_params)/1e6:.3f}M params")
+
+            # Base train dataset + disjoint held-out validation set for early stopping.
+            from torchvision import datasets as _tv
+            _root = str(Path(args.data_root))
+            if dataset == "cifar100":
+                base_train = _tv.CIFAR100(root=_root, train=True, transform=None,
+                                          download=args.download)
+                _all = list(range(len(base_train))); random.shuffle(_all)
+                val_indices = _all[:args.val_samples]
+                train_pool  = _all[args.val_samples:]
+                val_base = base_train
+            else:
+                base_train = _tv.DTD(root=_root, split="train", transform=None,
+                                     download=args.download)
+                val_base = _tv.DTD(root=_root, split="val", transform=None,
+                                   download=args.download)
+                _vp = list(range(len(val_base))); random.shuffle(_vp)
+                val_indices = _vp[:args.val_samples]
+                train_pool = list(range(len(base_train)))
+
+            use_earlystop = args.val_every > 0
+            if use_earlystop:
+                print(f"[FT] Early stopping ON: {len(val_indices)} val imgs every "
+                      f"{args.val_every} steps, patience={args.patience}")
+
+            best_val_acc = -1.0
+            best_state = None
+            vals_no_improve = 0
+            global_step = 0
+            stop_training = False
+            total_train_time = 0.0
+            total_train_energy = 0.0
+
+            for epoch in range(1, args.epochs + 1):
+                model.train()
+                pwr.reset_epoch()
+                torch.cuda.reset_peak_memory_stats(device)
+                loss_smooth = SmoothedValue(0.98)
+                start_epoch_t = time.time()
+                optimizer.zero_grad(set_to_none=True)
+
+                idxs = random.sample(train_pool, min(args.ft_steps, len(train_pool)))
+                n_steps = len(idxs)
+                iterator = idxs if args.no_progress else tqdm(
+                    idxs, total=n_steps, ncols=120, leave=False, desc=f"FT E{epoch}")
+
+                for step, idx in enumerate(iterator, start=1):
+                    img, label = base_train[idx]
+                    img = _to_rgb(img)
+                    class_name = class_names[label]
+                    torch.cuda.synchronize()
+                    p_start = pwr.sample_power_w()
+                    t0 = time.time()
+
+                    loss = train_step_sft_single(model, processor, img, class_name,
+                                                 prompt_text, device)
+                    if not torch.isfinite(loss):
+                        optimizer.zero_grad(set_to_none=True)
+                        global_step += 1
+                        continue
+                    (loss / args.grad_accum).backward()
+                    if step % args.grad_accum == 0 or step == n_steps:
+                        torch.nn.utils.clip_grad_norm_(trainable_params, max_norm=1.0)
+                        optimizer.step()
+                        optimizer.zero_grad(set_to_none=True)
+
+                    torch.cuda.synchronize()
+                    step_t = time.time() - t0
+                    pwr.log_step("train", epoch, step, step_t, p_start, pwr.sample_power_w())
+                    loss_smooth.update(loss.item())
+
+                    if step % args.log_interval == 0:
+                        peak = bytes_to_mib(torch.cuda.max_memory_allocated(device))
+                        print(f"[FT E{epoch} S{step:04d}] loss={loss.item():.4f} "
+                              f"sm={loss_smooth.value:.4f} peak={peak:.0f}MiB")
+
+                    # --- periodic validation + early stopping ---
+                    global_step += 1
+                    if use_earlystop and global_step % args.val_every == 0:
+                        torch.cuda.empty_cache()
+                        v = quick_val_acc(model, processor, val_base, val_indices,
+                                          class_names, prompt_text, device)
+                        improved = v > best_val_acc + 1e-6
+                        if improved:
+                            best_val_acc = v
+                            vals_no_improve = 0
+                            best_state = _get_lora_state(model)
+                            tag = "↑ best"
+                        else:
+                            vals_no_improve += 1
+                            tag = f"no-improve {vals_no_improve}/{args.patience}"
+                        print(f"[FT VAL @step {global_step}] val_acc={v:.2f}%  "
+                              f"(best={best_val_acc:.2f}%, {tag})")
+                        torch.cuda.empty_cache()
+                        if vals_no_improve >= args.patience:
+                            print(f"[FT] Early stop — no val improvement for "
+                                  f"{args.patience} checks. Best val_acc={best_val_acc:.2f}%")
+                            stop_training = True
+                            break
+
+                dt_train = time.time() - start_epoch_t
+                ep_totals = pwr.epoch_totals()
+                total_train_time   += dt_train
+                total_train_energy += ep_totals["train_energy_j"]
+                print(f"[FT Epoch {epoch}/{args.epochs}] sm_loss={loss_smooth.value:.4f} "
+                      f"TrainT={dt_train/60:.1f}m TrainEnergy={ep_totals['train_energy_j']:.0f}J")
+                if stop_training:
+                    break
+
+            if use_earlystop and best_state is not None:
+                _set_lora_state(model, best_state)
+                torch.cuda.empty_cache()
+                print(f"[FT] Restored best adapter (val_acc={best_val_acc:.2f}%) for final eval.")
+            elif use_earlystop:
+                print("[FT] No improving checkpoint captured — using last weights.")
+
+            print("\n[FT] Running final eval...")
+            pwr.reset_epoch()
+            acc, dt_eval = run_eval_generative(
                 model, processor, test_loader, class_names, prompt_text,
-                device, pwr, epoch_idx=0,
-            )
-        print(f"[{mode_tag}] Acc={base_acc:.2f}% Time={base_time:.2f}s")
+                device, pwr, epoch_idx=args.epochs)
+            eval_totals = pwr.epoch_totals()
+            total_energy = total_train_energy + eval_totals["eval_energy_j"]
+            total_time = total_train_time + dt_eval
+            avg_power = (total_energy / total_time) if total_time > 0 else float("nan")
+            sam_vals = compute_sam(acc, total_energy, ab_vals)
+            _best = f" | BestVal={best_val_acc:.2f}%" if use_earlystop else ""
+            print(f"[FINAL] Acc={acc:.2f}%{_best} TrainT={total_train_time/60:.1f}m "
+                  f"EvalT={dt_eval:.1f}s Energy={total_energy:.0f}J")
+            row = [args.epochs, f"{total_train_time:.3f}", f"{dt_eval:.3f}",
+                   f"{total_time:.3f}", f"{total_train_energy:.3f}",
+                   f"{eval_totals['eval_energy_j']:.3f}", f"{total_energy:.3f}",
+                   f"{avg_power:.3f}", f"{acc:.2f}"]
+            for a in ab_vals:
+                v = sam_vals[f"SAM_a{a}_b{a}"]
+                row.append(f"{v:.6f}" if not math.isnan(v) else "nan")
+            with open(metrics_csv_path, "a", newline="") as f:
+                csv.writer(f).writerow(row)
 
-        with open(metrics_csv_path, "a", newline="") as f:
-            row = [0, 0.0, f"{base_time:.3f}", f"{base_time:.3f}",
-                   0.0, 0.0, 0.0, 0.0, f"{base_acc:.2f}"]
-            for _ in ab_vals:
-                row.append("nan")
-            csv.writer(f).writerow(row)
+        # --- SFT training (legacy full / projector_lora modes) ---
+        elif args.epochs > 0:
+            if ft_mode == "projector_lora":
+                model = setup_projector_lora_smolvlm(model, n_lm_layers=6, lora_r=4)
+            else:
+                for p in model.parameters():
+                    p.requires_grad = True
 
-        # --- SFT training ---
-        if args.epochs > 0:
-            for p in model.parameters():
-                p.requires_grad = True
-
-            trainable_params = list(model.parameters())
+            trainable_params = [p for p in model.parameters() if p.requires_grad]
             optimizer = torch.optim.AdamW(trainable_params, lr=args.lr,
                                            weight_decay=args.weight_decay)
 
             total_params_m = sum(p.numel() for p in trainable_params) / 1e6
-            print(f"[SFT] LR={args.lr:.1e} | Trainable: {total_params_m:.1f}M params")
+            print(f"[SFT-{ft_mode.upper()}] LR={args.lr:.1e} | Trainable: {total_params_m:.1f}M params")
+
+            total_train_time = 0.0
+            total_train_energy = 0.0
 
             for epoch in range(1, args.epochs + 1):
                 pwr.reset_epoch()
@@ -863,6 +1297,10 @@ def train_single_run(args, dataset: str):
                     optimizer.zero_grad(set_to_none=True)
                     loss = train_step_sft(model, processor, images, names_batch,
                                           prompt_text, device)
+                    if not torch.isfinite(loss):
+                        if step % args.log_interval == 0 or step == 1:
+                            print(f"[E{epoch:02d} S{step:05d}] SKIP — loss={loss.item()}")
+                        continue
                     loss.backward()
                     torch.nn.utils.clip_grad_norm_(trainable_params, max_norm=1.0)
                     optimizer.step()
@@ -884,40 +1322,52 @@ def train_single_run(args, dataset: str):
                         break
 
                 dt_train = time.time() - start_epoch_t
+                ep_totals = pwr.epoch_totals()
+                total_train_time   += dt_train
+                total_train_energy += ep_totals["train_energy_j"]
 
-                acc, dt_eval = run_eval_generative(
-                    model, processor, test_loader, class_names, prompt_text,
-                    device, pwr, epoch_idx=epoch,
-                )
+                print(f"[Epoch {epoch}/{args.epochs}] sm_loss={loss_smooth.value:.4f} "
+                      f"TrainT={dt_train/60:.1f}m "
+                      f"TrainEnergy={ep_totals['train_energy_j']:.0f}J")
 
-                totals = pwr.epoch_totals()
-                sam_vals = compute_sam(acc, totals["total_energy_j"], ab_vals)
-                peak_epoch = bytes_to_mib(torch.cuda.max_memory_allocated(device))
+            # ---- Final eval (once, after all epochs) ----
+            print(f"\n[FT] All {args.epochs} epochs done — running final eval...")
+            pwr.reset_epoch()
+            acc, dt_eval = run_eval_generative(
+                model, processor, test_loader, class_names, prompt_text,
+                device, pwr, epoch_idx=args.epochs,
+            )
 
-                print(f"[Epoch {epoch}/{args.epochs}] Acc={acc:.2f}% "
-                      f"TrainT={dt_train / 60:.1f}m EvalT={dt_eval:.1f}s "
-                      f"AvgW={totals['avg_power_w']:.1f} "
-                      f"Energy={totals['total_energy_j']:.0f}J "
-                      f"PeakMem={peak_epoch:.0f}MiB")
+            eval_totals = pwr.epoch_totals()
+            total_energy = total_train_energy + eval_totals["eval_energy_j"]
+            total_time = total_train_time + dt_eval
+            avg_power = (total_energy / total_time) if total_time > 0 else float("nan")
+            sam_vals = compute_sam(acc, total_energy, ab_vals)
+            peak_final = bytes_to_mib(torch.cuda.max_memory_allocated(device))
 
-                row = [
-                    epoch,
-                    f"{totals['train_time_s']:.3f}",
-                    f"{totals['eval_time_s']:.3f}",
-                    f"{totals['total_time_s']:.3f}",
-                    f"{totals['train_energy_j']:.3f}",
-                    f"{totals['eval_energy_j']:.3f}",
-                    f"{totals['total_energy_j']:.3f}",
-                    f"{totals['avg_power_w']:.3f}",
-                    f"{acc:.2f}",
-                ]
-                for a in ab_vals:
-                    key = f"SAM_a{a}_b{a}"
-                    v = sam_vals[key]
-                    row.append(f"{v:.6f}" if not math.isnan(v) else "nan")
+            print(f"[FINAL] Acc={acc:.2f}% "
+                  f"TrainT={total_train_time/60:.1f}m EvalT={dt_eval:.1f}s "
+                  f"AvgW={avg_power:.1f} Energy={total_energy:.0f}J "
+                  f"PeakMem={peak_final:.0f}MiB")
 
-                with open(metrics_csv_path, "a", newline="") as f:
-                    csv.writer(f).writerow(row)
+            row = [
+                args.epochs,
+                f"{total_train_time:.3f}",
+                f"{dt_eval:.3f}",
+                f"{total_time:.3f}",
+                f"{total_train_energy:.3f}",
+                f"{eval_totals['eval_energy_j']:.3f}",
+                f"{total_energy:.3f}",
+                f"{avg_power:.3f}",
+                f"{acc:.2f}",
+            ]
+            for a in ab_vals:
+                key = f"SAM_a{a}_b{a}"
+                v = sam_vals[key]
+                row.append(f"{v:.6f}" if not math.isnan(v) else "nan")
+
+            with open(metrics_csv_path, "a", newline="") as f:
+                csv.writer(f).writerow(row)
 
     finally:
         pwr.close()
@@ -940,7 +1390,8 @@ def parse_args():
     ap.add_argument("--steps-per-epoch", type=int, default=STEPS_PER_EPOCH)
     ap.add_argument("--batch-size", type=int, default=BATCH_SIZE)
     ap.add_argument("--num-workers", type=int, default=NUM_WORKERS)
-    ap.add_argument("--lr", type=float, default=2e-5)
+    ap.add_argument("--lr", type=float, default=None,
+                    help="LR (default: 1e-5 for qlora light-touch, else 2e-5)")
     ap.add_argument("--weight-decay", type=float, default=0.01)
     ap.add_argument("--log-interval", type=int, default=50)
     ap.add_argument("--eval-batch-size", type=int, default=8)
@@ -964,8 +1415,31 @@ def parse_args():
     ap.add_argument("--use-hierarchical", action="store_true",
                     default=os.environ.get("VLM_USE_HIERARCHICAL", "0") == "1",
                     help="Use two-step hierarchical prompting for CIFAR-100")
+    ap.add_argument("--ft-mode", type=str,
+                    default=os.environ.get("VLM_FT_MODE", "full"),
+                    choices=["full", "projector_lora", "qlora"],
+                    help="SFT mode: full | projector_lora | qlora (light-touch all-layer "
+                         "LoRA + early stopping — recommended)")
+    ap.add_argument("--skip-baseline", action="store_true",
+                    default=os.environ.get("VLM_FT_SKIP_BASELINE", "0") == "1",
+                    help="Skip zero-shot baseline eval (valid with projector_lora/qlora)")
+    # --- qlora light-touch knobs ---
+    ap.add_argument("--ft-steps", type=int, default=300,
+                    help="qlora: training samples per epoch")
+    ap.add_argument("--grad-accum", type=int, default=8)
+    ap.add_argument("--lora-r", type=int, default=16)
+    ap.add_argument("--lora-alpha", type=int, default=32)
+    ap.add_argument("--val-every", type=int, default=25,
+                    help="qlora: validate + early-stop check every N steps (0=off)")
+    ap.add_argument("--val-samples", type=int, default=120)
+    ap.add_argument("--patience", type=int, default=3)
+    ap.add_argument("--load-4bit", action="store_true",
+                    help="qlora: load base in 4-bit (needs bitsandbytes; only useful for 2B)")
 
-    return ap.parse_args()
+    args = ap.parse_args()
+    if args.lr is None:
+        args.lr = 1e-5 if args.ft_mode == "qlora" else 2e-5
+    return args
 
 
 def main():

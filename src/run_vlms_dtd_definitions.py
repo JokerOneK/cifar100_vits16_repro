@@ -59,7 +59,7 @@ def run_model(model_key: str) -> int:
     print(f"{'='*70}\n")
 
     t0 = time.time()
-    result = subprocess.run(build_cmd(model_key), env=build_env(mod el_key))
+    result = subprocess.run(build_cmd(model_key), env=build_env(model_key))
     elapsed = time.time() - t0
 
     status = "OK" if result.returncode == 0 else f"FAILED (exit {result.returncode})"

@@ -57,7 +57,7 @@ from mobilevlm.utils import (
     disable_torch_init, process_images,
     tokenizer_image_token, KeywordsStoppingCriteria,
 )
-from mobilevlm.constants import IMAGE_TOKEN_INDEX, DEFAULT_IMAGE_TOKEN
+from mobilevlm.constants import IMAGE_TOKEN_INDEX, DEFAULT_IMAGE_TOKEN, IGNORE_INDEX
 
 # ========================= CONFIG =========================
 MODEL_PATH      = "mtgv/MobileVLM_V2-1.7B"
@@ -69,6 +69,22 @@ SEED            = 42
 CONV_MODE       = "v1"
 MAX_NEW_TOKENS  = 16
 MAX_SAMPLES     = None        # set e.g. 500 for quick test, None = full dataset
+# --- Fine-tuning (mirrors train_paligemma_textures.py) ---
+FT_MODE         = os.environ.get("VLM_FT_MODE", "zero_shot")  # "zero_shot" | "qlora"
+FT_EPOCHS       = int(os.environ.get("VLM_FT_EPOCHS", "1"))
+_default_ft_lr  = "2e-4" if FT_MODE == "qlora" else "2e-5"
+FT_LR           = float(os.environ.get("VLM_FT_LR", _default_ft_lr))
+FT_STEPS_PER_EPOCH = int(os.environ.get("VLM_FT_STEPS", "500"))
+FT_SKIP_BASELINE = os.environ.get("VLM_FT_SKIP_BASELINE", "0") == "1"
+FT_GRAD_ACCUM   = int(os.environ.get("VLM_FT_GRAD_ACCUM", "8"))
+FT_LORA_R       = int(os.environ.get("VLM_FT_LORA_R", "16"))
+FT_LORA_ALPHA   = int(os.environ.get("VLM_FT_LORA_ALPHA", "32"))
+FT_LORA_DROPOUT = float(os.environ.get("VLM_FT_LORA_DROPOUT", "0.05"))
+# light-touch: train with the eval prompt + early-stop on a held-out val subset
+FT_PROMPT_MODE  = os.environ.get("VLM_FT_PROMPT", "eval")     # "eval" | "short"
+FT_VAL_EVERY    = int(os.environ.get("VLM_FT_VAL_EVERY", "25"))
+FT_VAL_SAMPLES  = int(os.environ.get("VLM_FT_VAL_SAMPLES", "120"))
+FT_PATIENCE     = int(os.environ.get("VLM_FT_PATIENCE", "3"))
 # ==========================================================
 
 _outdir_env = os.environ.get("VLM_OUTDIR")
@@ -122,6 +138,10 @@ DTD_PROMPT = (
     "What texture or pattern does this image show? Choose exactly one from: {}. "
     "Answer with ONLY the texture name, nothing else."
 )
+
+# Short prompts for FT_PROMPT_MODE="short" (no class list).
+CIFAR100_FT_PROMPT = "What is in this image?"
+DTD_FT_PROMPT      = "What texture is shown?"
 
 DTD_DEFINITIONS = {
     "banded":       "parallel stripes of alternating colors",
@@ -390,23 +410,137 @@ def ensure_metrics_csv_header(ab_values, path):
             csv.writer(f).writerow(h)
 
 
+# ========================= LoRA / QLoRA HELPERS =========================
+class LoRALinear(torch.nn.Module):
+    """Drop-in LoRA wrapper for nn.Linear (or bnb Linear4bit). Base weight frozen;
+    trainable lora_A/lora_B live in fp32 for a stable backward while the base stays
+    in its original (4-bit / fp16) dtype."""
+    def __init__(self, linear, r=16, alpha=32, dropout=0.05):
+        super().__init__()
+        self.linear = linear
+        self.linear.weight.requires_grad = False
+        if getattr(linear, "bias", None) is not None:
+            self.linear.bias.requires_grad = False
+        self.scaling = alpha / r
+        in_f, out_f = linear.in_features, linear.out_features
+        dev = linear.weight.device
+        self.lora_A = torch.nn.Linear(in_f, r, bias=False).to(dtype=torch.float32, device=dev)
+        self.lora_B = torch.nn.Linear(r, out_f, bias=False).to(dtype=torch.float32, device=dev)
+        self.drop   = torch.nn.Dropout(p=dropout)
+        torch.nn.init.kaiming_uniform_(self.lora_A.weight, a=math.sqrt(5))
+        torch.nn.init.zeros_(self.lora_B.weight)
+
+    def forward(self, x):
+        base = self.linear(x)
+        lora = self.lora_B(self.lora_A(self.drop(x.to(torch.float32)))) * self.scaling
+        return base + lora.to(base.dtype)
+
+
+def _patch_bnb_dispatch():
+    """transformers 4.44 routes bnb models through accelerate.dispatch_model, whose
+    1.12 build calls model.to(device) — forbidden for 4-bit models (already placed on
+    GPU during load). No-op dispatch for quantized models (same fix as PaliGemma)."""
+    import transformers.modeling_utils as _mu
+    if getattr(_mu, "_bnb_dispatch_patched", False):
+        return
+    _orig = _mu.dispatch_model
+    def _safe(model, *a, **k):
+        if (getattr(model, "is_loaded_in_4bit", False)
+                or getattr(model, "is_loaded_in_8bit", False)
+                or getattr(model, "is_quantized", False)):
+            return model
+        return _orig(model, *a, **k)
+    _mu.dispatch_model = _safe
+    _mu._bnb_dispatch_patched = True
+
+
+def _relocate_buffers_to_gpu(model):
+    """Dispatch was skipped → move any non-persistent buffers left on CPU to the GPU."""
+    gpu = torch.device("cuda:0")
+    for _, mod in model.named_modules():
+        for bn, buf in list(mod._buffers.items()):
+            if buf is not None and buf.device != gpu:
+                mod._buffers[bn] = buf.to(gpu)
+
+
+def setup_qlora_mobilevlm(model, r=16, alpha=32, dropout=0.05):
+    """Freeze everything (4-bit base, vision tower, projector) and wrap LoRA on the
+    MobileLLaMA decoder's attention (q/k/v/o) + MLP (gate/up/down) across all layers.
+    Manual LoRALinear (not peft) keeps the model's custom generate(images=...) intact."""
+    for p in model.parameters():
+        p.requires_grad = False
+
+    lm_layers = model.get_model().layers
+    n_wrapped = 0
+    for layer in lm_layers:
+        attn = layer.self_attn
+        for proj in ("q_proj", "k_proj", "v_proj", "o_proj"):
+            if hasattr(attn, proj):
+                setattr(attn, proj, LoRALinear(getattr(attn, proj), r, alpha, dropout))
+                n_wrapped += 1
+        mlp = layer.mlp
+        for proj in ("gate_proj", "up_proj", "down_proj"):
+            if hasattr(mlp, proj):
+                setattr(mlp, proj, LoRALinear(getattr(mlp, proj), r, alpha, dropout))
+                n_wrapped += 1
+
+    trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
+    total     = sum(p.numel() for p in model.parameters())
+    print(f"[qlora] r={r} alpha={alpha} dropout={dropout} | wrapped {n_wrapped} Linears")
+    print(f"[qlora] Trainable: {trainable/1e6:.3f}M / {total/1e6:.1f}M "
+          f"({100*trainable/total:.2f}%)")
+    return model
+
+
+def _get_lora_state(model):
+    """Best-checkpoint snapshot for early stopping — only the trainable LoRA params, on CPU."""
+    return {n: p.detach().to("cpu", copy=True)
+            for n, p in model.named_parameters() if p.requires_grad}
+
+
+def _set_lora_state(model, state):
+    with torch.no_grad():
+        for n, p in model.named_parameters():
+            if n in state:
+                p.copy_(state[n].to(p.device))
+
+
 # ========================= MODEL =========================
-def build_mobilevlm(model_path):
-    """Load MobileVLM V2: avoid device_map='auto' to keep all weights on one GPU."""
+def build_mobilevlm(model_path, quantize_4bit=False):
+    """Load MobileVLM V2 on a single GPU. quantize_4bit=True loads the MobileLLaMA LM
+    in 4-bit NF4 (QLoRA); the vision tower + projector stay fp16."""
     disable_torch_init()
     print(f"[MobileVLM] Loading {model_path}...")
 
     from mobilevlm.model.mobilellama import MobileLlamaForCausalLM
-    from transformers import AutoTokenizer, CLIPImageProcessor
+    from transformers import AutoTokenizer, CLIPImageProcessor, BitsAndBytesConfig
 
     tokenizer = AutoTokenizer.from_pretrained(model_path, use_fast=False)
-    model = MobileLlamaForCausalLM.from_pretrained(
-        model_path,
-        torch_dtype=torch.float16,
-        device_map=None,         # no accelerate dispatch — single GPU
-        low_cpu_mem_usage=True,
-    )
-    model = model.to(device)
+    if quantize_4bit:
+        _patch_bnb_dispatch()
+        bnb_config = BitsAndBytesConfig(
+            load_in_4bit=True,
+            bnb_4bit_quant_type="nf4",
+            bnb_4bit_compute_dtype=torch.float16,
+            bnb_4bit_use_double_quant=True,
+        )
+        print("[MobileVLM] Loading LM in 4-bit NF4 (QLoRA)...")
+        model = MobileLlamaForCausalLM.from_pretrained(
+            model_path,
+            quantization_config=bnb_config,
+            device_map={"": 0},
+            torch_dtype=torch.float16,
+            low_cpu_mem_usage=True,
+        )
+        _relocate_buffers_to_gpu(model)
+    else:
+        model = MobileLlamaForCausalLM.from_pretrained(
+            model_path,
+            torch_dtype=torch.float16,
+            device_map=None,         # no accelerate dispatch — single GPU
+            low_cpu_mem_usage=True,
+        )
+        model = model.to(device)
     model.eval()
 
     vision_tower = model.get_model().get_vision_tower()
@@ -472,15 +606,18 @@ def generate_for_image(model, tokenizer, image_processor, image, prompt_str):
     stop_str = conv.sep if conv.sep_style != SeparatorStyle.TWO else conv.sep2
     stopping = KeywordsStoppingCriteria([stop_str], tokenizer, input_ids)
 
-    output_ids = model.generate(
-        input_ids,
-        images=images_tensor,
-        do_sample=False,
-        temperature=1.0,
-        max_new_tokens=MAX_NEW_TOKENS,
-        stopping_criteria=[stopping],
-        use_cache=True,
-    )
+    # autocast(fp16) harmonizes dtypes when trainable LoRA params are fp32 but the
+    # base model is 4-bit/fp16 (no-op for the un-fine-tuned baseline model).
+    with torch.autocast(device_type="cuda", dtype=torch.float16):
+        output_ids = model.generate(
+            input_ids,
+            images=images_tensor,
+            do_sample=False,
+            temperature=1.0,
+            max_new_tokens=MAX_NEW_TOKENS,
+            stopping_criteria=[stopping],
+            use_cache=True,
+        )
 
     generated = tokenizer.decode(
         output_ids[0, input_ids.shape[1]:], skip_special_tokens=True
@@ -488,6 +625,66 @@ def generate_for_image(model, tokenizer, image_processor, image, prompt_str):
     if stop_str and generated.endswith(stop_str):
         generated = generated[:-len(stop_str)].strip()
     return generated
+
+
+def train_step_sft_mobilevlm(model, tokenizer, image_processor, image,
+                             class_name, prompt_str, _debug=False):
+    """SFT step. MobileLLaMA computes the loss internally when `labels` are passed;
+    prepare_inputs_labels_for_multimodal expands the image token and realigns labels,
+    so we just mask the prompt prefix and unmask the answer (class name + </s>)."""
+    full_prompt = DEFAULT_IMAGE_TOKEN + "\n" + prompt_str
+
+    # Length of the prompt-only tokenization (assistant turn empty) — everything up to
+    # here is masked; the answer that follows is supervised.
+    conv_p = conv_templates[CONV_MODE].copy()
+    conv_p.append_message(conv_p.roles[0], full_prompt)
+    conv_p.append_message(conv_p.roles[1], None)
+    n_prompt = tokenizer_image_token(
+        conv_p.get_prompt(), tokenizer, IMAGE_TOKEN_INDEX, return_tensors="pt").shape[0]
+
+    # Full sequence: prompt + answer + sep2 ("</s>").
+    conv_f = conv_templates[CONV_MODE].copy()
+    conv_f.append_message(conv_f.roles[0], full_prompt)
+    conv_f.append_message(conv_f.roles[1], class_name)
+    input_ids = tokenizer_image_token(
+        conv_f.get_prompt(), tokenizer, IMAGE_TOKEN_INDEX, return_tensors="pt"
+    ).unsqueeze(0).to(device)
+
+    labels = input_ids.clone()
+    labels[0, :n_prompt] = IGNORE_INDEX
+
+    images_tensor = process_images(
+        [image], image_processor, model.config).to(device, dtype=torch.float16)
+
+    if _debug:
+        print(f"[DEBUG] input_ids={tuple(input_ids.shape)} n_prompt={n_prompt} "
+              f"n_answer={input_ids.shape[1]-n_prompt} images={tuple(images_tensor.shape)}")
+
+    out = model(input_ids=input_ids, images=images_tensor, labels=labels, use_cache=False)
+    return out.loss
+
+
+@torch.no_grad()
+def quick_val_acc(model, tokenizer, image_processor, val_ds, val_indices,
+                  class_names, prompt_str):
+    """Greedy-generation accuracy on a small held-out subset — early-stopping signal."""
+    was_training = model.training
+    model.eval()
+    correct = 0
+    for i in val_indices:
+        img, label = val_ds[i]
+        if isinstance(img, torch.Tensor):
+            img = transforms.ToPILImage()(img)
+        elif not isinstance(img, Image.Image):
+            img = Image.fromarray(np.array(img))
+        if img.mode != "RGB":
+            img = img.convert("RGB")
+        gen = generate_for_image(model, tokenizer, image_processor, img, prompt_str)
+        if match_class(gen, class_names) == label:
+            correct += 1
+    if was_training:
+        model.train()
+    return 100.0 * correct / max(len(val_indices), 1)
 
 
 # ========================= EVAL LOOP =========================
@@ -621,36 +818,217 @@ def run_experiment(dataset_name):
     print(f"[{dataset_name.upper()}] {len(class_names)} classes | "
           f"{n_samples} test images (of {len(test_ds)})")
 
-    tokenizer, model, image_processor, context_len = build_mobilevlm(MODEL_PATH)
+    tokenizer, model, image_processor, context_len = build_mobilevlm(
+        MODEL_PATH, quantize_4bit=(FT_MODE == "qlora"))
     pwr = GpuPowerMeter(device_index=GPU_INDEX, step_energy_path=step_energy_gz)
 
     try:
-        use_hier = USE_HIERARCHICAL and dataset_name == "cifar100"
-        mode_tag = "HIERARCHICAL" if use_hier else "ZERO-SHOT"
-        print(f">>> {mode_tag} evaluation...")
-        pwr.reset_epoch()
-        if use_hier:
-            acc, eval_time = run_eval_hierarchical(
-                model, tokenizer, image_processor,
-                test_ds, class_names, pwr, epoch_idx=0)
+        # ---- Zero-shot / hierarchical baseline ----
+        if not FT_SKIP_BASELINE:
+            use_hier = USE_HIERARCHICAL and dataset_name == "cifar100"
+            mode_tag = "HIERARCHICAL" if use_hier else "ZERO-SHOT"
+            print(f">>> {mode_tag} evaluation...")
+            pwr.reset_epoch()
+            if use_hier:
+                acc, eval_time = run_eval_hierarchical(
+                    model, tokenizer, image_processor,
+                    test_ds, class_names, pwr, epoch_idx=0)
+            else:
+                acc, eval_time = run_eval_generative(
+                    model, tokenizer, image_processor,
+                    test_ds, class_names, prompt_tpl, pwr, epoch_idx=0)
+
+            totals = pwr.epoch_totals()
+            print(f"\n[{mode_tag}] Acc={acc:.2f}% | Time={eval_time:.1f}s | "
+                  f"AvgW={totals['avg_power_w']:.1f} | Energy={totals['total_energy_j']:.0f}J")
+
+            sam_vals = compute_sam(acc, totals["total_energy_j"], ab_vals)
+            row = [0, 0.0, f"{eval_time:.3f}", f"{eval_time:.3f}",
+                   0.0, f"{totals['eval_energy_j']:.3f}", f"{totals['total_energy_j']:.3f}",
+                   f"{totals['avg_power_w']:.3f}", f"{acc:.2f}"]
+            for a in ab_vals:
+                v = sam_vals[f"SAM_a{a}_b{a}"]
+                row.append(f"{v:.6f}" if not math.isnan(v) else "nan")
+            with open(metrics_csv, "a", newline="") as f:
+                csv.writer(f).writerow(row)
         else:
+            print("[SKIP BASELINE] Skipping zero-shot eval — using existing results.")
+
+        # ---- QLoRA light-touch fine-tuning ----
+        if FT_MODE == "qlora" and FT_EPOCHS > 0:
+            model = setup_qlora_mobilevlm(model, r=FT_LORA_R, alpha=FT_LORA_ALPHA,
+                                          dropout=FT_LORA_DROPOUT)
+            trainable_params = [p for p in model.parameters() if p.requires_grad]
+            optimizer = torch.optim.AdamW(trainable_params, lr=FT_LR, weight_decay=0.01)
+
+            if dataset_name == "cifar100":
+                train_ds_ft = datasets.CIFAR100(root=str(DATA_ROOT), train=True,
+                                                transform=None, download=True)
+            else:
+                train_ds_ft = datasets.DTD(root=str(DATA_ROOT), split="train",
+                                           transform=None, download=True)
+
+            # Eval prompt (long, with class list) — used for final eval, and for
+            # training+validation when FT_PROMPT_MODE=="eval" (match train to eval).
+            if "{}" in prompt_tpl:
+                _cl = ", ".join(cn.replace("_", " ") for cn in class_names)
+                eval_prompt_str = prompt_tpl.format(_cl)
+            else:
+                eval_prompt_str = prompt_tpl
+            if FT_PROMPT_MODE == "eval":
+                ft_prompt = eval_prompt_str
+            else:
+                ft_prompt = CIFAR100_FT_PROMPT if dataset_name == "cifar100" else DTD_FT_PROMPT
+
+            # Disjoint held-out validation set for early stopping.
+            use_earlystop = FT_VAL_EVERY > 0
+            val_ds = val_indices = None
+            train_pool = list(range(len(train_ds_ft)))
+            if use_earlystop:
+                if dataset_name == "dtd":
+                    val_ds = datasets.DTD(root=str(DATA_ROOT), split="val",
+                                          transform=None, download=True)
+                    _vp = list(range(len(val_ds))); random.shuffle(_vp)
+                    val_indices = _vp[:FT_VAL_SAMPLES]
+                else:
+                    random.shuffle(train_pool)
+                    val_ds = train_ds_ft
+                    val_indices = train_pool[:FT_VAL_SAMPLES]
+                    train_pool = train_pool[FT_VAL_SAMPLES:]
+                print(f"[FT] Early stopping ON: {len(val_indices)} val imgs every "
+                      f"{FT_VAL_EVERY} steps, patience={FT_PATIENCE}")
+
+            print(f"\n[FT] qlora | Epochs={FT_EPOCHS} Steps={FT_STEPS_PER_EPOCH} "
+                  f"GradAccum={FT_GRAD_ACCUM} LR={FT_LR:.1e} prompt={FT_PROMPT_MODE}")
+            print(f"[FT] Trainable: {sum(p.numel() for p in trainable_params)/1e6:.3f}M params")
+            torch.cuda.empty_cache()
+
+            best_val_acc = -1.0
+            best_state = None
+            vals_no_improve = 0
+            global_step = 0
+            stop_training = False
+            total_train_time = 0.0
+            total_train_energy = 0.0
+
+            for epoch in range(1, FT_EPOCHS + 1):
+                model.train()
+                pwr.reset_epoch()
+                torch.cuda.reset_peak_memory_stats(device)
+                start_epoch_t = time.time()
+                total_loss = 0.0
+                optimizer.zero_grad(set_to_none=True)
+
+                indices = random.sample(train_pool, min(FT_STEPS_PER_EPOCH, len(train_pool)))
+                n_steps = len(indices)
+
+                for step, idx in enumerate(tqdm(indices, desc=f"FT Epoch {epoch}", leave=False), 1):
+                    img, label = train_ds_ft[idx]
+                    if isinstance(img, torch.Tensor):
+                        img = transforms.ToPILImage()(img)
+                    elif not isinstance(img, Image.Image):
+                        img = Image.fromarray(np.array(img))
+                    if img.mode != "RGB":
+                        img = img.convert("RGB")
+
+                    class_name = class_names[label]
+                    if step == 1 or step % 10 == 0:
+                        torch.cuda.empty_cache()
+                    _maybe_sync()
+                    p_start = pwr.sample_power_w()
+                    t0 = time.time()
+
+                    _is_first = (epoch == 1 and step == 1)
+                    with torch.autocast(device_type="cuda", dtype=torch.float16):
+                        loss = train_step_sft_mobilevlm(
+                            model, tokenizer, image_processor, img, class_name,
+                            ft_prompt, _debug=_is_first)
+                    if _is_first:
+                        print(f"[DEBUG] step1 loss={loss.item()}")
+                    if not torch.isfinite(loss):
+                        optimizer.zero_grad(set_to_none=True)
+                        if step % 10 == 0 or step == 1:
+                            print(f"[FT E{epoch} S{step:03d}] SKIP — loss={loss.item()}")
+                        continue
+                    (loss / FT_GRAD_ACCUM).backward()
+                    if step % FT_GRAD_ACCUM == 0 or step == n_steps:
+                        torch.nn.utils.clip_grad_norm_(trainable_params, max_norm=1.0)
+                        optimizer.step()
+                        optimizer.zero_grad(set_to_none=True)
+
+                    step_t = time.time() - t0
+                    _maybe_sync()
+                    pwr.log_step("train", epoch, step, step_t, p_start, pwr.sample_power_w())
+                    total_loss += loss.item()
+
+                    if step % 10 == 0:
+                        peak = torch.cuda.max_memory_allocated(device) / 1024**3
+                        print(f"[FT E{epoch} S{step:03d}] loss={loss.item():.4f} "
+                              f"avg={total_loss/step:.4f} peak={peak:.2f}GB")
+
+                    # --- periodic validation + early stopping ---
+                    global_step += 1
+                    if use_earlystop and global_step % FT_VAL_EVERY == 0:
+                        torch.cuda.empty_cache()
+                        v_acc = quick_val_acc(model, tokenizer, image_processor,
+                                              val_ds, val_indices, class_names, eval_prompt_str)
+                        improved = v_acc > best_val_acc + 1e-6
+                        if improved:
+                            best_val_acc = v_acc
+                            vals_no_improve = 0
+                            best_state = _get_lora_state(model)
+                            tag = "↑ best"
+                        else:
+                            vals_no_improve += 1
+                            tag = f"no-improve {vals_no_improve}/{FT_PATIENCE}"
+                        print(f"[FT VAL @step {global_step}] val_acc={v_acc:.2f}%  "
+                              f"(best={best_val_acc:.2f}%, {tag})")
+                        torch.cuda.empty_cache()
+                        if vals_no_improve >= FT_PATIENCE:
+                            print(f"[FT] Early stop — no val improvement for {FT_PATIENCE} "
+                                  f"checks. Best val_acc={best_val_acc:.2f}%")
+                            stop_training = True
+                            break
+
+                dt_train = time.time() - start_epoch_t
+                ep_totals = pwr.epoch_totals()
+                total_train_time   += dt_train
+                total_train_energy += ep_totals["train_energy_j"]
+                print(f"[FT Epoch {epoch}/{FT_EPOCHS}] avg_loss={total_loss/max(step,1):.4f} "
+                      f"TrainT={dt_train/60:.1f}min TrainEnergy={ep_totals['train_energy_j']:.0f}J")
+                if stop_training:
+                    break
+
+            # Restore best checkpoint (early stopping) before final eval.
+            if use_earlystop and best_state is not None:
+                _set_lora_state(model, best_state)
+                torch.cuda.empty_cache()
+                print(f"[FT] Restored best adapter (val_acc={best_val_acc:.2f}%) for final eval.")
+            elif use_earlystop:
+                print("[FT] No improving checkpoint captured — using last weights.")
+
+            print("\n[FT] Running final eval...")
+            pwr.reset_epoch()
             acc, eval_time = run_eval_generative(
-                model, tokenizer, image_processor,
-                test_ds, class_names, prompt_tpl, pwr, epoch_idx=0)
-
-        totals = pwr.epoch_totals()
-        print(f"\n[{mode_tag}] Acc={acc:.2f}% | Time={eval_time:.1f}s | "
-              f"AvgW={totals['avg_power_w']:.1f} | Energy={totals['total_energy_j']:.0f}J")
-
-        sam_vals = compute_sam(acc, totals["total_energy_j"], ab_vals)
-        row = [0, 0.0, f"{eval_time:.3f}", f"{eval_time:.3f}",
-               0.0, f"{totals['eval_energy_j']:.3f}", f"{totals['total_energy_j']:.3f}",
-               f"{totals['avg_power_w']:.3f}", f"{acc:.2f}"]
-        for a in ab_vals:
-            v = sam_vals[f"SAM_a{a}_b{a}"]
-            row.append(f"{v:.6f}" if not math.isnan(v) else "nan")
-        with open(metrics_csv, "a", newline="") as f:
-            csv.writer(f).writerow(row)
+                model, tokenizer, image_processor, test_ds, class_names, prompt_tpl,
+                pwr, epoch_idx=FT_EPOCHS)
+            eval_totals = pwr.epoch_totals()
+            total_energy = total_train_energy + eval_totals["eval_energy_j"]
+            avg_power = (total_energy / (total_train_time + eval_time)
+                         if (total_train_time + eval_time) > 0 else float("nan"))
+            sam_vals = compute_sam(acc, total_energy, ab_vals)
+            row = [FT_EPOCHS, f"{total_train_time:.3f}", f"{eval_time:.3f}",
+                   f"{total_train_time + eval_time:.3f}",
+                   f"{total_train_energy:.3f}", f"{eval_totals['eval_energy_j']:.3f}",
+                   f"{total_energy:.3f}", f"{avg_power:.3f}", f"{acc:.2f}"]
+            for a in ab_vals:
+                v = sam_vals[f"SAM_a{a}_b{a}"]
+                row.append(f"{v:.6f}" if not math.isnan(v) else "nan")
+            with open(metrics_csv, "a", newline="") as f:
+                csv.writer(f).writerow(row)
+            _best = f" | BestVal={best_val_acc:.2f}%" if use_earlystop else ""
+            print(f"[FT FINAL] Acc={acc:.2f}%{_best} "
+                  f"TrainT={total_train_time/60:.1f}min EvalT={eval_time/60:.1f}min")
 
     finally:
         pwr.close()
@@ -661,7 +1039,60 @@ def run_experiment(dataset_name):
     return metrics_csv
 
 
+def _parse_cli_args():
+    """CLI flags override the env-var-derived defaults."""
+    import argparse
+    ap = argparse.ArgumentParser(
+        description="MobileVLM V2-1.7B zero-shot / QLoRA on CIFAR-100 / DTD")
+    ap.add_argument("--mode", choices=["zero_shot", "qlora"], default=FT_MODE)
+    ap.add_argument("--datasets", default=",".join(DATASETS),
+                    help="comma list, e.g. 'dtd' or 'cifar100,dtd'")
+    ap.add_argument("--skip-baseline", action="store_true", default=FT_SKIP_BASELINE)
+    ap.add_argument("--epochs", type=int, default=FT_EPOCHS)
+    ap.add_argument("--steps", type=int, default=FT_STEPS_PER_EPOCH)
+    ap.add_argument("--grad-accum", type=int, default=FT_GRAD_ACCUM)
+    ap.add_argument("--lora-r", type=int, default=FT_LORA_R)
+    ap.add_argument("--lora-alpha", type=int, default=FT_LORA_ALPHA)
+    ap.add_argument("--lora-dropout", type=float, default=FT_LORA_DROPOUT)
+    ap.add_argument("--lr", type=float, default=None,
+                    help="LoRA LR (default 2e-4 for qlora, else 2e-5)")
+    ap.add_argument("--ft-prompt", choices=["eval", "short"], default=FT_PROMPT_MODE)
+    ap.add_argument("--val-every", type=int, default=FT_VAL_EVERY,
+                    help="validate + early-stop check every N steps (0=off)")
+    ap.add_argument("--val-samples", type=int, default=FT_VAL_SAMPLES)
+    ap.add_argument("--patience", type=int, default=FT_PATIENCE)
+    ap.add_argument("--max-samples", type=int, default=MAX_SAMPLES,
+                    help="cap eval images (debug); default = full set")
+    return ap.parse_args()
+
+
 if __name__ == "__main__":
+    _args = _parse_cli_args()
+    FT_MODE            = _args.mode
+    DATASETS           = [d.strip() for d in _args.datasets.split(",") if d.strip()]
+    FT_SKIP_BASELINE   = _args.skip_baseline
+    FT_EPOCHS          = _args.epochs
+    FT_STEPS_PER_EPOCH = _args.steps
+    FT_GRAD_ACCUM      = _args.grad_accum
+    FT_LORA_R          = _args.lora_r
+    FT_LORA_ALPHA      = _args.lora_alpha
+    FT_LORA_DROPOUT    = _args.lora_dropout
+    FT_PROMPT_MODE     = _args.ft_prompt
+    FT_VAL_EVERY       = _args.val_every
+    FT_VAL_SAMPLES     = _args.val_samples
+    FT_PATIENCE        = _args.patience
+    MAX_SAMPLES        = _args.max_samples
+    if _args.lr is not None:
+        FT_LR = _args.lr
+    elif FT_MODE == "qlora":
+        FT_LR = 2e-4
+
+    print(f"[CONFIG] mode={FT_MODE} datasets={DATASETS} skip_baseline={FT_SKIP_BASELINE} "
+          f"epochs={FT_EPOCHS} steps={FT_STEPS_PER_EPOCH} grad_accum={FT_GRAD_ACCUM} "
+          f"lora_r={FT_LORA_R} lora_alpha={FT_LORA_ALPHA} lr={FT_LR:.1e}")
+    print(f"[CONFIG] ft_prompt={FT_PROMPT_MODE} val_every={FT_VAL_EVERY} "
+          f"val_samples={FT_VAL_SAMPLES} patience={FT_PATIENCE}")
+
     results = {}
     for ds in DATASETS:
         try:

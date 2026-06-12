@@ -46,7 +46,7 @@ except ImportError:
 # -------------------------------
 EPOCHS = 10
 STEPS_PER_EPOCH = 782
-BATCH_SIZE = 64
+BATCH_SIZE = 32
 NUM_WORKERS = 2  # Kaggle обычно стабильно на 2-4
 MODEL_NAME = "vit_small_patch16_224"
 SEED = 42
